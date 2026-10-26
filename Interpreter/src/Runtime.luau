@@ -85,6 +85,22 @@ end
 
 local Close = Runtime.Close
 
+-- Returns an empty table whose hash part has the size the host gives luaH_new(L, 0, count).
+-- Why: insertion order into a presized hash decides traversal order, and scripts rely on matching the host.
+-- Growing through inserts leaves the same node count but different collision chains, so the dummy keys are
+-- cleared (table.clear also resets the free-slot cursor), leaving a fresh presized hash.
+-- @param count number – number of hash keys the table is sized for
+function Runtime.PresizedHash(count: number): { [any]: any }
+	local t = {}
+	if count > 0 then
+		for i = 1, count do
+			t[i + 0.5] = true
+		end
+		table.clear(t)
+	end
+	return t
+end
+
 -- Creates the host-closure factory of a compiled proto.
 -- The call path is written out in full in each arity variant: a VM call costs one host frame (two with the
 -- handler that made it) and a tail call reuses the factory's frame position, matching host recursion depth.

@@ -13,8 +13,10 @@
 local Types = require("@self/Types")
 local Deserialize = require("@self/Deserializer")
 local Compiler = require("@self/Compiler")
+local Env = require("@self/Env")
 
 export type Options = Types.Options
+export type EnvState = Env.State
 
 local Interpreter = {}
 
@@ -38,8 +40,18 @@ end
 function Interpreter.Load(bytecode: string | buffer, env: { [any]: any }?, options: Options?): (...any) -> ...any
 	local opts: Options = options or {}
 	local chunk = Deserialize(bytecode, opts.Vector or DefaultVector)
-	return Compiler.Compile(chunk, env or _G, opts.SafeEnv ~= false, opts.ChunkName)
+	local globals = env or _G
+	local dyn: Env.State? = nil
+	if opts.DynamicEnv == true then
+		dyn = Env.New()
+	elseif opts.DynamicEnv then
+		dyn = opts.DynamicEnv :: any
+	end
+	return Compiler.Compile(chunk, globals, opts.SafeEnv ~= false, opts.ChunkName, dyn, opts.Debug)
 end
+
+-- Creates a DynamicEnv state to share between chunks, so getfenv/setfenv see each other's closures.
+Interpreter.NewEnvState = Env.New
 
 -- Exposes the parser for tooling (disassemblers, analyzers) without running anything.
 Interpreter.Deserialize = Deserialize

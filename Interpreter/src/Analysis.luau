@@ -118,6 +118,7 @@ export type Program = {
 	EdgeN: { [number]: Edge },
 	EdgeT: { [number]: Edge },
 	BodyEdge: { [number]: Edge },
+	EdgeE: { [number]: Edge }, -- numeric loops: exit taken when the loop runs zero times, if it differs
 	LoopAt: { [number]: Loop },
 	Wrappers: { [number]: { Loop } },
 	Loops: { Loop },
@@ -125,6 +126,7 @@ export type Program = {
 	Kept: { [number]: boolean },
 	Calls: { [number]: CallPlan },
 	Pairs: { [number]: number }, -- first pc of a fused pair -> second pc
+	BranchDead: { [number]: boolean }, -- fused value+branch pairs whose value is never read after the branch
 	Bools: { [number]: Bool }, -- branches that only materialize a boolean
 	ForOperands: { [number]: { number } }, -- FORNPREP: limit, step, start operands
 	CompareK: { [number]: { Side: "A" | "B", Operand: number } }, -- compare operand replaced by a constant slot
@@ -140,17 +142,20 @@ local Analysis = {}
 Analysis.Op = Op
 Analysis.HAS_AUX = HAS_AUX
 
--- Resolves an import path against the environment; nil when any step is missing.
-local function ResolveImport(env: any, path: { any }): any
+-- Resolves an import path against the environment at load time; nil when any step is missing or is not a table.
+-- Why: indexing anything else could run metamethods or raise at load, so those paths are left to run time.
+function Analysis.ResolveImport(env: any, path: { any }): any
 	local v = env[path[1]]
 	for i = 2, #path do
-		if v == nil then
+		if type(v) ~= "table" then
 			return nil
 		end
 		v = v[path[i]]
 	end
 	return v
 end
+
+local ResolveImport = Analysis.ResolveImport
 
 -- Decodes the key path of a GETIMPORT.
 -- @param id number – AUX word: count in the top 2 bits, three 10-bit constant indices
@@ -171,7 +176,9 @@ end
 -- @param cells { boolean } – which upvalues of this proto are shared cells
 -- @param env table – environment imports resolve against
 -- @param safeEnv boolean – whether imports may be resolved once, here
-function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: boolean): Program
+-- @param noChain boolean? – return every edge to a trampoline (Debug mode: no host frame outlives its handler, so
+-- the GC sees only the guest registers, as on the host)
+function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: boolean, noChain: boolean?): Program
 	local code = proto.Code
 	local K = proto.Constants
 	local size = #code
@@ -248,6 +255,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 	local live: { number } = {}
 	local NextPc: { [number]: number } = {}
 	local TargetPc: { [number]: number } = {}
+	local EmptyPc: { [number]: number } = {} -- FORNPREP whose zero-iteration exit differs from its normal exit
 	local Tail: { [number]: boolean } = {}
 	local loops: { Loop } = {}
 	local LoopAt: { [number]: Loop } = {}
@@ -275,11 +283,24 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 		elseif op == Op.LOADB then
 			NextPc[pc] = Resolve(pc + 1 + C[pc])
 		elseif op == Op.FORNPREP then
-			local last = pc + D[pc]
-			assert(OpOf[last] == Op.FORNLOOP, "malformed numeric for loop")
+			-- the FORNLOOP closing this loop jumps back to the body start; the zero-iteration exit (FORNPREP's own
+			-- jump) usually lands right after it, but the compiler may thread it elsewhere
+			local last = pc + 1
+			while last <= size and not (OpOf[last] == Op.FORNLOOP and JumpTarget(last) == pc + 1) do
+				last += Len[last]
+			end
+			if last > size then
+				-- a body that always breaks leaves its FORNLOOP unreachable, jumping forward; it sits before the exit
+				last = pc + D[pc]
+				assert(OpOf[last] == Op.FORNLOOP, "malformed numeric for loop")
+			end
 			LoopAt[pc] = NewLoop("numeric", pc, pc + 1, last, last)
 			NextPc[pc] = Resolve(last + 1)
 			TargetPc[pc] = Resolve(pc + 1)
+			local empty = Resolve(JumpTarget(pc))
+			if empty ~= NextPc[pc] then
+				EmptyPc[pc] = empty
+			end
 		elseif FORG_PREP[op] then
 			local last = JumpTarget(pc)
 			assert(OpOf[last] == Op.FORGLOOP, "malformed generic for loop")
@@ -322,6 +343,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 	for _, pc in live do
 		AddPred(pc, NextPc[pc])
 		AddPred(pc, TargetPc[pc])
+		AddPred(pc, EmptyPc[pc])
 	end
 
 	-- registers captured by reference can change behind a call, so their reads are never moved
@@ -536,18 +558,49 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 
 	local selectFn = (select :: any)
 
-	-- error/assert loaded only to be called: the load can produce a wrapper that knows the call's position
+	-- error/assert loaded only to be called: the load produces a wrapper that knows the call's position.
+	-- The load is found by scanning back in code order, so it is found across the joins O0 code creates.
+	local orderIndex: { [number]: number } = {}
+	for i, pc in order do
+		orderIndex[pc] = i
+	end
+	local function GlobalName(pc: number): string?
+		local op = OpOf[pc]
+		if op == Op.GETGLOBAL then
+			return K[Aux[pc] + 1]
+		elseif op == Op.GETIMPORT and rshift(Aux[pc], 30) == 1 then
+			return K[band(rshift(Aux[pc], 20), 0x3FF) + 1]
+		end
+		return nil
+	end
 	local positioned: { [number]: number } = {}
 	for _, pc in live do
 		local op = OpOf[pc]
-		if op == Op.CALL or op == Op.CALLFB then
-			local w = Writer(Window(pc), A[pc])
-			if w and OpOf[w] == Op.GETIMPORT then
-				local value = ImportValue(w)
-				if rawequal(value, error) or rawequal(value, assert) then
-					positioned[w] = pc
+		if op ~= Op.CALL and op ~= Op.CALLFB then
+			continue
+		end
+		local r = A[pc]
+		local i = orderIndex[pc] - 1
+		local steps = 0
+		while i >= 1 and steps < 64 do
+			local p = order[i]
+			local name = GlobalName(p)
+			if name ~= nil and A[p] == r then
+				if name == "error" or name == "assert" then
+					positioned[p] = pc
 				end
+				break
 			end
+			local lo, hi, reads = Effects(p)
+			if lo == nil then
+				if not (BRANCH[OpOf[p]] or PURE_JUMP[OpOf[p]] or REMOVED[OpOf[p]]) then
+					break
+				end
+			elseif (r >= lo and r <= hi) or reads(r) then
+				break
+			end
+			i -= 1
+			steps += 1
 		end
 	end
 
@@ -635,6 +688,9 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 			end
 			if TargetPc[pc] then
 				TargetPc[pc] = Resolve(TargetPc[pc])
+			end
+			if EmptyPc[pc] then
+				EmptyPc[pc] = Resolve(EmptyPc[pc])
 			end
 		end
 		entry = Resolve(entry)
@@ -739,7 +795,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 	do
 		local predCount: { [number]: number } = {}
 		for _, pc in live do
-			for _, dst in { NextPc[pc], TargetPc[pc] } do
+			for _, dst in { NextPc[pc], TargetPc[pc], EmptyPc[pc] } do
 				predCount[dst] = (predCount[dst] or 0) + 1
 			end
 		end
@@ -777,11 +833,12 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 
 	-- adjacent pairs with a fused handler (see Ops/Fused): the second instruction is absorbed by the first
 	local pairs: { [number]: number } = {}
+	local branchDead: { [number]: boolean } = {}
 	do
 		local predCount: { [number]: number } = {}
 		predCount[entry] = 1
 		for _, pc in live do
-			for _, dst in { NextPc[pc], TargetPc[pc] } do
+			for _, dst in { NextPc[pc], TargetPc[pc], EmptyPc[pc] } do
 				predCount[dst] = (predCount[dst] or 0) + 1
 			end
 		end
@@ -799,9 +856,21 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 			return op >= Op.ADDK and op <= Op.DIVK
 		end
 
+		-- field loads of getfenv/setfenv stay unfused: DynamicEnv swaps them for VM-aware versions
+		local function Swapped(pc: number): boolean
+			if OpOf[pc] ~= Op.GETTABLEKS then
+				return false
+			end
+			local key = K[Aux[pc] + 1]
+			return key == "getfenv" or key == "setfenv"
+		end
+
 		local function Fusable(p1: number, p2: number): boolean
 			local o1, o2 = OpOf[p1], OpOf[p2]
 			local a1 = A[p1]
+			if Swapped(p1) or Swapped(p2) then
+				return false
+			end
 			if IsGetK(o1) then
 				return IsGetK(o2)
 					or (IsSetK(o2) and A[p2] == a1)
@@ -830,7 +899,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 				return false
 			end
 			local tests = o2 == Op.JUMPIF or o2 == Op.JUMPIFNOT or (o2 >= Op.JUMPXEQKNIL and o2 <= Op.JUMPXEQKS)
-			return tests and (IsGetK(o1) or o1 == Op.GETTABLE or o1 == Op.MODK)
+			return tests and not Swapped(p1) and (IsGetK(o1) or o1 == Op.GETTABLE or o1 == Op.MODK)
 		end
 
 		local absorbed: { [number]: boolean } = {}
@@ -842,6 +911,11 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 			if p2 and p2 > p1 and predCount[p2] == 1 and TargetPc[p2] and NextPc[p2] and FusableBranch(p1, p2) then
 				pairs[p1] = p2
 				absorbed[p2] = true
+				-- a tested value nobody reads again is never stored: faster, and a stale register cannot keep a
+				-- weakly referenced value alive across the next allocation
+				if DeadAfter(p2, A[p1]) then
+					branchDead[p1] = true
+				end
 				NextPc[p1] = NextPc[p2]
 				TargetPc[p1] = TargetPc[p2]
 				continue
@@ -878,6 +952,9 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 		NoteBack(pc, NextPc[pc])
 		if not LoopAt[pc] then
 			NoteBack(pc, TargetPc[pc])
+		end
+		if EmptyPc[pc] then
+			NoteBack(pc, EmptyPc[pc])
 		end
 	end
 	local wrappers: { [number]: { Loop } } = {}
@@ -936,6 +1013,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 	local EdgeN: { [number]: Edge } = {}
 	local EdgeT: { [number]: Edge } = {}
 	local BodyEdge: { [number]: Edge } = {}
+	local EdgeE: { [number]: Edge } = {}
 
 	-- Registers a returned edge with the trampoline that will receive it.
 	local function Bounce(src: number, dst: number)
@@ -969,7 +1047,8 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 
 		local here = Inner[src]
 		local depth = Depth[src] or 1
-		local chain = dst > src
+		local chain = not noChain
+			and dst > src
 			and (here == nil or dst <= here.Hi)
 			and depth < CHAIN_LIMIT
 			and not (BOUNCE_CALLS and IsCall(dst))
@@ -992,11 +1071,19 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 			elseif not Contains(loop, first) then
 				Bounce(pc, first)
 				BodyEdge[pc] = { Pc = first, Chain = false }
+			elseif noChain then
+				-- the loop handler settles its own body
+				table.insert(loop.MemberPcs, first)
+				Depth[first] = math.max(Depth[first] or 0, 1)
+				BodyEdge[pc] = { Pc = first, Chain = false }
 			else
 				Depth[first] = math.max(Depth[first] or 0, 1)
 				BodyEdge[pc] = { Pc = first, Chain = true }
 			end
 			EdgeN[pc] = Plan(pc, NextPc[pc])
+			if EmptyPc[pc] then
+				EdgeE[pc] = Plan(pc, EmptyPc[pc])
+			end
 		else
 			local n, t = NextPc[pc], TargetPc[pc]
 			if n then
@@ -1021,6 +1108,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 		EdgeN = EdgeN,
 		EdgeT = EdgeT,
 		BodyEdge = BodyEdge,
+		EdgeE = EdgeE,
 		LoopAt = LoopAt,
 		Wrappers = wrappers,
 		Loops = loops,
@@ -1028,6 +1116,7 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 		Kept = kept,
 		Calls = calls,
 		Pairs = pairs,
+		BranchDead = branchDead,
 		Bools = bools,
 		ForOperands = forOperands,
 		CompareK = compareK,

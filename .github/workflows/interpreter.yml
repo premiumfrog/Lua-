@@ -1,0 +1,31 @@
+name: interpreter
+
+on:
+  push:
+    branches:
+      - 'master'
+    paths:
+      - 'Interpreter/**'
+      - 'tests/conformance/**'
+      - 'Compiler/**'
+      - 'VM/**'
+      - '.github/workflows/interpreter.yml'
+  pull_request:
+    paths:
+      - 'Interpreter/**'
+      - 'tests/conformance/**'
+      - 'Compiler/**'
+      - 'VM/**'
+      - '.github/workflows/interpreter.yml'
+
+jobs:
+  test:
+    name: Luau bytecode interpreter
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: build luau and luau-compile
+      run: make -j4 config=release luau luau-compile
+    - name: run interpreter tests (conformance + tests/unit, O0-O2, fast and debug)
+      working-directory: Interpreter
+      run: python3 tests/run.py ../luau ../luau-compile

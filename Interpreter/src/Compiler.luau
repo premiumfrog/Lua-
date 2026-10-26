@@ -18,11 +18,13 @@ local Calls = require("./Ops/Calls")
 local Branches = require("./Ops/Branches")
 local Loops = require("./Ops/Loops")
 local Closures = require("./Ops/Closures")
+local Env = require("./Env")
 local Fused = require("./Ops/Fused")
 
 type Proto = Types.Proto
 type Chunk = Types.Chunk
 type Handler = Types.Handler
+type Frame = Types.Frame
 type Factory = Types.Factory
 type Edge = Analysis.Edge
 
@@ -48,6 +50,8 @@ type Context = {
 	Env: any,
 	SafeEnv: boolean,
 	ChunkName: string?,
+	Dyn: Env.State?, -- DynamicEnv state; nil binds globals to Env at load
+	Debug: boolean, -- track the running pc so host-raised errors carry guest positions
 }
 
 -- Decides which upvalues of every proto are shared cells; a child slot is a cell when any capture site passes a
@@ -128,6 +132,41 @@ local function GuestAssert(where: string): (...any) -> ...any
 	end
 end
 
+-- Debug mode: frame key holding the pc of the running handler
+local PC = "\0pc"
+
+-- Debug mode: records the handler's pc before running it.
+-- @param h Handler – handler to wrap
+-- @param pc number – its instruction
+local function Track(h: Handler, pc: number): Handler
+	return function(S)
+		S[PC] = pc
+		return h(S)
+	end
+end
+
+-- Runs a proto body to completion on the frame (the factory's trampoline).
+local function Run(entry: Handler, S: Frame)
+	local f = entry(S)
+	while f do
+		f = f(S)
+	end
+end
+
+-- Debug mode: runs the body under pcall and repositions errors raised inside interpreter handlers.
+-- @param entry Handler – the proto's first handler
+-- @param Where (number) -> string – guest position prefix of a pc
+local function Guard(entry: Handler, Where: (number) -> string): Handler
+	return function(S)
+		local ok, err = pcall(Run, entry, S)
+		if not ok then
+			local pc = S[PC]
+			error(Env.Reposition(err, if pc then Where(pc) else ""), 0)
+		end
+		return nil
+	end
+end
+
 -- Compiles one proto; returns its entry handler and the constant slot layout its factory preloads.
 -- @param proto Proto – deserialized proto
 -- @param index number – proto index (selects its cell layout)
@@ -136,7 +175,8 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 	local cells = ctx.Cells[index]
 	local env = ctx.Env
 	local K = proto.Constants
-	local prog = Analysis.Analyze(proto, cells, env, ctx.SafeEnv)
+	local dyn = ctx.Dyn
+	local prog = Analysis.Analyze(proto, cells, env, ctx.SafeEnv and dyn == nil, ctx.Debug)
 
 	local OpOf, OA, OB, OC, OD, Aux, Len = prog.Op, prog.A, prog.B, prog.C, prog.D, prog.Aux, prog.Len
 	local base = prog.Base
@@ -155,6 +195,22 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			return `{name}:{lines[pc]}: `
 		end
 		return ""
+	end
+
+	-- Values swapped when guest code reads them: VM-aware getfenv/setfenv, positioned error/assert wrappers.
+	local function Swaps(pc: number): { [any]: any }?
+		local swaps: { [any]: any }? = nil
+		if dyn then
+			swaps = { [Env.HostGetfenv] = dyn.getfenv, [Env.HostSetfenv] = dyn.setfenv }
+		end
+		local site = prog.Positioned[pc]
+		local where = if site then Where(site) else ""
+		if where ~= "" then
+			swaps = swaps or {}
+			;(swaps :: any)[error] = GuestError(where)
+			;(swaps :: any)[assert] = GuestAssert(where)
+		end
+		return swaps
 	end
 
 	local Top: { [number]: Handler } = {}
@@ -285,6 +341,7 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		local t, tc = Value(prog.EdgeT[p1])
 		local o1, o2 = OpOf[p1], OpOf[p2]
 		local A1, B1 = OA[p1] + base, OB[p1] + base
+		local dead = if prog.BranchDead[p1] then "Dead" else ""
 		local first, operand
 		if o1 == Op.GETTABLE then
 			first, operand = "Get", OC[p1] + base
@@ -297,14 +354,14 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			if o2 == Op.JUMPIFNOT then
 				n, nc, t, tc = t, tc, n, nc
 			end
-			return Fused.Branch[first .. "Truthy"](A1, B1, operand, n, nc, t, tc)
+			return Fused.Branch[first .. "Truthy" .. dead](A1, B1, operand, n, nc, t, tc)
 		end
 		local aux = Aux[p2]
 		if rshift(aux, 31) == 1 then
 			n, nc, t, tc = t, tc, n, nc
 		end
 		local k = if o2 == Op.JUMPXEQKNIL then nil elseif o2 == Op.JUMPXEQKB then band(aux, 1) == 1 else K[band(aux, 0xFFFFFF) + 1]
-		return Fused.Branch[first .. "EqK"](A1, B1, operand, k, n, nc, t, tc)
+		return Fused.Branch[first .. "EqK" .. dead](A1, B1, operand, k, n, nc, t, tc)
 	end
 
 	local function Build(pc: number): Handler
@@ -330,7 +387,12 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			local exit, exitChain = Value(prog.EdgeN[pc])
 			if op == Op.FORNPREP then
 				local operands = prog.ForOperands[pc]
-				return Loops.Numeric(A + 2, Slot(operands[1]), Slot(operands[2]), Slot(operands[3]), body, loop.Token, loop.Members, exit, exitChain)
+				local emptyEdge = prog.EdgeE[pc]
+				local empty, emptyChain
+				if emptyEdge then
+					empty, emptyChain = Value(emptyEdge)
+				end
+				return Loops.Numeric(A + 2, Slot(operands[1]), Slot(operands[2]), Slot(operands[3]), body, loop.Token, loop.Members, exit, exitChain, empty, emptyChain)
 			end
 			return Loops.Generic(A, band(Aux[loop.Hi], 0xFF), body, loop.Token, loop.Members, exit, exitChain)
 		end
@@ -435,9 +497,20 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			return Values.LoadK(A, K[Aux[pc] + 1], nextH, chain)
 		elseif op == Op.MOVE then
 			return Values.Move(A, B + base, nextH, chain)
+		elseif op == Op.GETGLOBAL and dyn then
+			return Values.GetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], Swaps(pc), nextH, chain)
 		elseif op == Op.GETGLOBAL then
+			local site = prog.Positioned[pc]
+			local where = if site then Where(site) else ""
+			if where ~= "" then
+				-- the global may be replaced at any time, so the swap for a positioned wrapper happens per read
+				return Values.GetGlobalSwapped(A, env, K[Aux[pc] + 1], { [error] = GuestError(where), [assert] = GuestAssert(where) }, nextH, chain)
+			end
 			return Values.GetGlobal(A, env, K[Aux[pc] + 1], nextH, chain)
 		elseif op == Op.SETGLOBAL then
+			if dyn then
+				return Values.SetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], nextH, chain)
+			end
 			return Values.SetGlobal(A, env, K[Aux[pc] + 1], nextH, chain)
 		elseif op == Op.GETUPVAL then
 			if cells[B + 1] then
@@ -448,22 +521,20 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			return Values.SetUpval(A, B + 1, cells[B + 1] == true, nextH, chain)
 		elseif op == Op.CLOSEUPVALS then
 			return Values.CloseUpvals(A, nextH, chain)
+		elseif op == Op.GETIMPORT and dyn then
+			local path = Analysis.ImportPath(K, Aux[pc])
+			local resolved = if ctx.SafeEnv and not dyn.Unsafe[env] then Analysis.ResolveImport(env, path) else nil
+			return Values.GetImportDyn(A, Env.ENV, path, resolved, env, dyn.Unsafe, Swaps(pc), nextH, chain)
 		elseif op == Op.GETIMPORT then
 			local path = Analysis.ImportPath(K, Aux[pc])
 			if ctx.SafeEnv then
 				local value = prog.Imports[pc]
 				if value == nil then
-					value = env[path[1]]
-					for i = 2, #path do
-						if value == nil then
-							break
-						end
-						value = value[path[i]]
-					end
+					value = Analysis.ResolveImport(env, path)
 				end
 				local site = prog.Positioned[pc]
 				local where = if site then Where(site) else ""
-				if where ~= "" then
+				if where ~= "" and (rawequal(value, error) or rawequal(value, assert)) then
 					value = if rawequal(value, error) then GuestError(where) else GuestAssert(where)
 				end
 				if value ~= nil then
@@ -476,7 +547,11 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		elseif op == Op.SETTABLE then
 			return Tables.Set(A, B + base, C + base, nextH, chain)
 		elseif op == Op.GETTABLEKS then
-			return Tables.GetK(A, B + base, K[Aux[pc] + 1], nextH, chain)
+			local key = K[Aux[pc] + 1]
+			if dyn and (key == "getfenv" or key == "setfenv") then
+				return Values.GetKSwapped(A, B + base, key, Swaps(pc) :: any, nextH, chain)
+			end
+			return Tables.GetK(A, B + base, key, nextH, chain)
 		elseif op == Op.SETTABLEKS then
 			return Tables.SetK(A, B + base, K[Aux[pc] + 1], nextH, chain)
 		elseif op == Op.GETUDATAKS then
@@ -488,7 +563,7 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		elseif op == Op.SETTABLEN then
 			return Tables.SetK(A, B + base, C + 1, nextH, chain)
 		elseif op == Op.NEWTABLE then
-			return Tables.New(A, Aux[pc], nextH, chain)
+			return Tables.New(A, Aux[pc], if B == 0 then 0 else bit32.lshift(1, B - 1), nextH, chain)
 		elseif op == Op.DUPTABLE then
 			return Tables.Dup(A, K[D + 1], nextH, chain)
 		elseif op == Op.SETLIST then
@@ -569,9 +644,9 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			local make = ctx.Factories[child]
 			assert(make, "child proto compiled out of order")
 			if op == Op.NEWCLOSURE then
-				return Closures.New(A, make, kinds, sources, nextH, chain)
+				return Closures.New(A, make, kinds, sources, nextH, chain, dyn)
 			end
-			return Closures.Dup(A, make, kinds, sources, nextH, chain)
+			return Closures.Dup(A, make, kinds, sources, nextH, chain, dyn)
 		end
 
 		return Unsupported(op)
@@ -587,6 +662,9 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 				h = Loops.Back(h, loop.Token, loop.Members)
 			end
 		end
+		if ctx.Debug then
+			h = Track(h, pc)
+		end
 		Top[pc] = h
 	end
 
@@ -596,7 +674,11 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		end
 	end
 
-	return Top[prog.Entry], consts, prog.ConstCount
+	local entry = Top[prog.Entry]
+	if ctx.Debug then
+		entry = Guard(entry, Where)
+	end
+	return entry, consts, prog.ConstCount
 end
 
 local Compiler = {}
@@ -606,7 +688,9 @@ local Compiler = {}
 -- @param env table – global environment for GETGLOBAL/SETGLOBAL/GETIMPORT
 -- @param safeEnv boolean – resolve imports once at load
 -- @param chunkName string? – prefix for guest error positions; nil leaves messages without one
-function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: string?): (...any) -> ...any
+-- @param dyn Env.State? – DynamicEnv state (per-closure environments, getfenv/setfenv)
+-- @param debug boolean? – position host-raised errors at the guest line (slower)
+function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: string?, dyn: Env.State?, debug: boolean?): (...any) -> ...any
 	local protos = chunk.Protos
 	local ctx: Context = {
 		Cells = ResolveCells(chunk),
@@ -614,6 +698,8 @@ function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: s
 		Env = env,
 		SafeEnv = safeEnv,
 		ChunkName = chunkName,
+		Dyn = dyn,
+		Debug = debug == true,
 	}
 
 	-- children before parents, so closure makers can capture their child's factory directly
@@ -635,7 +721,27 @@ function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: s
 	end
 	Visit(chunk.Main)
 
+	if dyn then
+		local U = { [Env.ENV] = env }
+		local main = ctx.Factories[chunk.Main](U)
+		U[Env.FN] = main
+		dyn.Owners[main] = U
+		return main
+	end
 	return ctx.Factories[chunk.Main]({})
 end
+
+-- interpreter frames are invisible to guest stack levels (getfenv/setfenv under DynamicEnv)
+for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler } do
+	for _, member in module :: any do
+		if type(member) == "function" then
+			Env.MarkInternal(member)
+			break
+		end
+	end
+end
+Env.MarkInternal(ResolveCells)
+Env.MarkInternal(Env.Reposition)
+Env.MarkGuarded(Run)
 
 return Compiler

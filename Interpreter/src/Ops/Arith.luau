@@ -269,18 +269,36 @@ end
 -- @param B number – first source frame index
 -- @param C number – last source frame index
 function Arith.Concat(A: number, B: number, C: number, Next: Handler, Chain: boolean): Handler
+	if A >= B and A <= C then
+		if C == B + 1 then
+			return function(S)
+				S[A] = S[B] .. S[C]
+				return if Chain then Next(S) else Next
+			end
+		elseif C == B + 2 then
+			return function(S)
+				S[A] = S[B] .. S[B + 1] .. S[C]
+				return if Chain then Next(S) else Next
+			end
+		end
+	end
+	-- A outside the operands: its old value is dropped first. The host collects after the instruction, once A
+	-- holds the result; here the collection step runs inside the expression, before the store.
 	if C == B + 1 then
 		return function(S)
+			S[A] = nil
 			S[A] = S[B] .. S[C]
 			return if Chain then Next(S) else Next
 		end
 	elseif C == B + 2 then
 		return function(S)
+			S[A] = nil
 			S[A] = S[B] .. S[B + 1] .. S[C]
 			return if Chain then Next(S) else Next
 		end
 	end
 	return function(S)
+		S[A] = nil
 		local acc = S[C]
 		for i = C - 1, B, -1 do
 			acc = S[i] .. acc

@@ -57,6 +57,21 @@ local function MissingMethod(object: any, key: string, where: string): never
 	error(`{where}attempt to call missing method '{key}' of {typeof(object)}`, 0)
 end
 
+-- Method lookup on a non-table: userdata with a __namecall metamethod dispatches every method call through it.
+-- Why: the host's NAMECALL checks __namecall before indexing userdata.
+local function Lookup(object: any, key: string): any
+	if type(object) == "userdata" then
+		local mt = getmetatable(object)
+		if type(mt) == "table" then
+			local handler = rawget(mt, "__namecall")
+			if handler ~= nil then
+				return handler
+			end
+		end
+	end
+	return object[key]
+end
+
 -- Calls through a callee held in a frame slot (register or constant slot).
 local function ViaFrame(A: number, F: number, Args: { number }, Results: number, Next: Handler, Chain: boolean): Handler?
 	local X, Y, Z = Args[1], Args[2], Args[3]
@@ -108,42 +123,58 @@ local function ViaFrame(A: number, F: number, Args: { number }, Results: number,
 			end
 		end
 	elseif Results == 0 then
+		-- the callee stays in A, as the host's CALL leaves it: a folded callee load must not leave a stale
+		-- register holding the only reference to a collectable value (weak-table tests observe this)
 		if n == 0 then
 			if Chain then
 				return function(S)
-					S[F]()
+					local f = S[F]
+					S[A] = f
+					f()
 					return Next(S)
 				end
 			end
 			return function(S)
-				S[F]()
+				local f = S[F]
+				S[A] = f
+				f()
 				return Next
 			end
 		elseif n == 1 then
 			if Chain then
 				return function(S)
-					S[F](S[X])
+					local f = S[F]
+					S[A] = f
+					f(S[X])
 					return Next(S)
 				end
 			end
 			return function(S)
-				S[F](S[X])
+				local f = S[F]
+				S[A] = f
+				f(S[X])
 				return Next
 			end
 		elseif n == 2 then
 			if Chain then
 				return function(S)
-					S[F](S[X], S[Y])
+					local f = S[F]
+					S[A] = f
+					f(S[X], S[Y])
 					return Next(S)
 				end
 			end
 			return function(S)
-				S[F](S[X], S[Y])
+				local f = S[F]
+				S[A] = f
+				f(S[X], S[Y])
 				return Next
 			end
 		elseif n == 3 then
 			return function(S)
-				S[F](S[X], S[Y], S[Z])
+				local f = S[F]
+				S[A] = f
+				f(S[X], S[Y], S[Z])
 				return if Chain then Next(S) else Next
 			end
 		end
@@ -216,17 +247,23 @@ local function ViaUpvalue(A: number, U: number, Args: { number }, Results: numbe
 	elseif Results == 0 then
 		if n == 0 then
 			return function(S)
-				S[1][U]()
+				local f = S[1][U]
+				S[A] = f
+				f()
 				return if Chain then Next(S) else Next
 			end
 		elseif n == 1 then
 			return function(S)
-				S[1][U](S[X])
+				local f = S[1][U]
+				S[A] = f
+				f(S[X])
 				return if Chain then Next(S) else Next
 			end
 		elseif n == 2 then
 			return function(S)
-				S[1][U](S[X], S[Y])
+				local f = S[1][U]
+				S[A] = f
+				f(S[X], S[Y])
 				return if Chain then Next(S) else Next
 			end
 		end
@@ -275,6 +312,7 @@ function Calls.Call(A: number, F: number?, U: number?, Args: { number }?, Result
 		end
 		return function(S)
 			local fn = if F then S[F] else S[1][U :: number]
+			S[A] = fn
 			local values = table.create(count)
 			for i = 1, count do
 				values[i] = S[list[i]]
@@ -337,7 +375,7 @@ function Calls.NameCall(A: number, B: number, K: string, Where: string, Next: Ha
 	local A1 = A + 1
 	return function(S)
 		local self = S[B]
-		local fn = self[K]
+		local fn = if type(self) == "table" then self[K] else Lookup(self, K)
 		if fn == nil then
 			MissingMethod(self, K, Where)
 		end
@@ -358,7 +396,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 			if Chain then
 				return function(S)
 					local o = S[O]
-					local fn = o[K]
+					local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 					if fn == nil then
 						MissingMethod(o, K, Where)
 					end
@@ -368,7 +406,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 			end
 			return function(S)
 				local o = S[O]
-				local fn = o[K]
+				local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 				if fn == nil then
 					MissingMethod(o, K, Where)
 				end
@@ -379,7 +417,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 			if Chain then
 				return function(S)
 					local o = S[O]
-					local fn = o[K]
+					local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 					if fn == nil then
 						MissingMethod(o, K, Where)
 					end
@@ -389,7 +427,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 			end
 			return function(S)
 				local o = S[O]
-				local fn = o[K]
+				local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 				if fn == nil then
 					MissingMethod(o, K, Where)
 				end
@@ -399,7 +437,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 		elseif n == 2 then
 			return function(S)
 				local o = S[O]
-				local fn = o[K]
+				local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 				if fn == nil then
 					MissingMethod(o, K, Where)
 				end
@@ -411,10 +449,11 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 		if n == 0 then
 			return function(S)
 				local o = S[O]
-				local fn = o[K]
+				local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 				if fn == nil then
 					MissingMethod(o, K, Where)
 				end
+				S[A] = fn
 				fn(o)
 				return if Chain then Next(S) else Next
 			end
@@ -422,30 +461,33 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 			if Chain then
 				return function(S)
 					local o = S[O]
-					local fn = o[K]
+					local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 					if fn == nil then
 						MissingMethod(o, K, Where)
 					end
+					S[A] = fn
 					fn(o, S[X])
 					return Next(S)
 				end
 			end
 			return function(S)
 				local o = S[O]
-				local fn = o[K]
+				local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 				if fn == nil then
 					MissingMethod(o, K, Where)
 				end
+				S[A] = fn
 				fn(o, S[X])
 				return Next
 			end
 		elseif n == 2 then
 			return function(S)
 				local o = S[O]
-				local fn = o[K]
+				local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 				if fn == nil then
 					MissingMethod(o, K, Where)
 				end
+				S[A] = fn
 				fn(o, S[X], S[Y])
 				return if Chain then Next(S) else Next
 			end
@@ -455,7 +497,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 	if n <= 1 then
 		return function(S)
 			local o = S[O]
-			local fn = o[K]
+			local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 			if fn == nil then
 				MissingMethod(o, K, Where)
 			end
@@ -471,7 +513,7 @@ function Calls.Method(A: number, O: number, K: string, Args: { number }, Results
 	local count = n
 	return function(S)
 		local o = S[O]
-		local fn = o[K]
+		local fn = if type(o) == "table" then o[K] else Lookup(o, K)
 		if fn == nil then
 			MissingMethod(o, K, Where)
 		end

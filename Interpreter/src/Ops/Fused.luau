@@ -1743,6 +1743,78 @@ Fused.Branch.GetKEqK = function(A1: number, B1: number, K1: any, K2: any, N: Han
 	end
 end
 
+-- Constant-key field load feeding JUMPIF; value not kept.
+Fused.Branch.GetKTruthyDead = function(A1: number, B1: number, K1: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+	if NC and TC then
+		return function(S)
+			local v = S[B1][K1]
+			if v then
+				return T(S)
+			end
+			return N(S)
+		end
+	elseif NC then
+		return function(S)
+			local v = S[B1][K1]
+			if v then
+				return T
+			end
+			return N(S)
+		end
+	elseif TC then
+		return function(S)
+			local v = S[B1][K1]
+			if v then
+				return T(S)
+			end
+			return N
+		end
+	end
+	return function(S)
+		local v = S[B1][K1]
+		if v then
+			return T
+		end
+		return N
+	end
+end
+
+-- Constant-key field load feeding a JUMPXEQK compare; value not kept.
+Fused.Branch.GetKEqKDead = function(A1: number, B1: number, K1: any, K2: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+	if NC and TC then
+		return function(S)
+			local v = S[B1][K1]
+			if v == K2 then
+				return T(S)
+			end
+			return N(S)
+		end
+	elseif NC then
+		return function(S)
+			local v = S[B1][K1]
+			if v == K2 then
+				return T
+			end
+			return N(S)
+		end
+	elseif TC then
+		return function(S)
+			local v = S[B1][K1]
+			if v == K2 then
+				return T(S)
+			end
+			return N
+		end
+	end
+	return function(S)
+		local v = S[B1][K1]
+		if v == K2 then
+			return T
+		end
+		return N
+	end
+end
+
 -- Register-key table load feeding JUMPIF.
 Fused.Branch.GetTruthy = function(A1: number, B1: number, C1: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
 	if NC and TC then
@@ -1823,6 +1895,78 @@ Fused.Branch.GetEqK = function(A1: number, B1: number, C1: number, K2: any, N: H
 	end
 end
 
+-- Register-key table load feeding JUMPIF; value not kept.
+Fused.Branch.GetTruthyDead = function(A1: number, B1: number, C1: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+	if NC and TC then
+		return function(S)
+			local v = S[B1][S[C1]]
+			if v then
+				return T(S)
+			end
+			return N(S)
+		end
+	elseif NC then
+		return function(S)
+			local v = S[B1][S[C1]]
+			if v then
+				return T
+			end
+			return N(S)
+		end
+	elseif TC then
+		return function(S)
+			local v = S[B1][S[C1]]
+			if v then
+				return T(S)
+			end
+			return N
+		end
+	end
+	return function(S)
+		local v = S[B1][S[C1]]
+		if v then
+			return T
+		end
+		return N
+	end
+end
+
+-- Register-key table load feeding a JUMPXEQK compare; value not kept.
+Fused.Branch.GetEqKDead = function(A1: number, B1: number, C1: number, K2: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+	if NC and TC then
+		return function(S)
+			local v = S[B1][S[C1]]
+			if v == K2 then
+				return T(S)
+			end
+			return N(S)
+		end
+	elseif NC then
+		return function(S)
+			local v = S[B1][S[C1]]
+			if v == K2 then
+				return T
+			end
+			return N(S)
+		end
+	elseif TC then
+		return function(S)
+			local v = S[B1][S[C1]]
+			if v == K2 then
+				return T(S)
+			end
+			return N
+		end
+	end
+	return function(S)
+		local v = S[B1][S[C1]]
+		if v == K2 then
+			return T
+		end
+		return N
+	end
+end
+
 -- MODK feeding JUMPIF.
 Fused.Branch.ModKTruthy = function(A1: number, B1: number, K1: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
 	if NC and TC then
@@ -1896,6 +2040,78 @@ Fused.Branch.ModKEqK = function(A1: number, B1: number, K1: any, K2: any, N: Han
 	return function(S)
 		local v = S[B1] % K1
 		S[A1] = v
+		if v == K2 then
+			return T
+		end
+		return N
+	end
+end
+
+-- MODK feeding JUMPIF; value not kept.
+Fused.Branch.ModKTruthyDead = function(A1: number, B1: number, K1: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+	if NC and TC then
+		return function(S)
+			local v = S[B1] % K1
+			if v then
+				return T(S)
+			end
+			return N(S)
+		end
+	elseif NC then
+		return function(S)
+			local v = S[B1] % K1
+			if v then
+				return T
+			end
+			return N(S)
+		end
+	elseif TC then
+		return function(S)
+			local v = S[B1] % K1
+			if v then
+				return T(S)
+			end
+			return N
+		end
+	end
+	return function(S)
+		local v = S[B1] % K1
+		if v then
+			return T
+		end
+		return N
+	end
+end
+
+-- MODK feeding a JUMPXEQK compare; value not kept.
+Fused.Branch.ModKEqKDead = function(A1: number, B1: number, K1: any, K2: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+	if NC and TC then
+		return function(S)
+			local v = S[B1] % K1
+			if v == K2 then
+				return T(S)
+			end
+			return N(S)
+		end
+	elseif NC then
+		return function(S)
+			local v = S[B1] % K1
+			if v == K2 then
+				return T
+			end
+			return N(S)
+		end
+	elseif TC then
+		return function(S)
+			local v = S[B1] % K1
+			if v == K2 then
+				return T(S)
+			end
+			return N
+		end
+	end
+	return function(S)
+		local v = S[B1] % K1
 		if v == K2 then
 			return T
 		end

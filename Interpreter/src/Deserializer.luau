@@ -5,6 +5,9 @@
 -- Pure data transform: no execution and no environment access, so it is safe on untrusted input.
 
 local Types = require("./Types")
+local Runtime = require("./Runtime")
+
+local PresizedHash = Runtime.PresizedHash
 
 type Proto = Types.Proto
 type Chunk = Types.Chunk
@@ -175,11 +178,20 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 
 		-- templates reference other constants by index, so they are built once every constant is known
 		for k, fields in templates do
-			local template = {}
+			local template = PresizedHash(#fields // 2)
+			local nilKeys = {}
 			for i = 1, #fields, 2 do
+				local key = constants[fields[i] + 1]
 				local vi = fields[i + 1]
-				-- placeholder 0 mirrors the host loader: the field exists (presized) until the constructor overwrites it
-				template[constants[fields[i] + 1]] = if vi >= 0 then constants[vi + 1] else 0
+				local value = if vi >= 0 then constants[vi + 1] else nil
+				-- placeholder 0 mirrors the host loader: every field gets its node in order, nil constants last
+				template[key] = if value == nil then 0 else value
+				if vi >= 0 and value == nil then
+					table.insert(nilKeys, key)
+				end
+			end
+			for _, key in nilKeys do
+				template[key] = nil
 			end
 			constants[k] = template
 		end

@@ -40,7 +40,29 @@ end
 -- @param Limit number – frame index of the limit
 -- @param Step number – frame index of the step
 -- @param Start number – frame index of the initial value
-function Loops.Numeric(I: number, Limit: number, Step: number, Start: number, Body: Handler, Token: any, Members: { [any]: boolean }, Exit: Handler, Chain: boolean): Handler
+-- @param Empty Handler? – successor when the loop runs zero times, when the compiler gave it its own exit
+-- @param EmptyChain boolean? – whether Empty is chained
+function Loops.Numeric(I: number, Limit: number, Step: number, Start: number, Body: Handler, Token: any, Members: { [any]: boolean }, Exit: Handler, Chain: boolean, Empty: Handler?, EmptyChain: boolean?): Handler
+	if Empty then
+		return function(S)
+			local entered = false
+			for i = S[Start], S[Limit], S[Step] do
+				entered = true
+				S[I] = i
+				local f = Body(S)
+				if f ~= Token then
+					f = Settle(S, f, Token, Members)
+					if f ~= Token then
+						return f
+					end
+				end
+			end
+			if not entered then
+				return if EmptyChain then (Empty :: Handler)(S) else Empty
+			end
+			return if Chain then Exit(S) else Exit
+		end
+	end
 	return function(S)
 		for i = S[Start], S[Limit], S[Step] do
 			S[I] = i

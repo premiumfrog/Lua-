@@ -13,6 +13,7 @@
 
 local Types = require("../Types")
 local Runtime = require("../Runtime")
+local Env = require("../Env")
 
 type Handler = Types.Handler
 type Factory = Types.Factory
@@ -20,6 +21,7 @@ type Factory = Types.Factory
 local create = table.create
 local rawequal = rawequal
 local Capture = Runtime.Capture
+local ENV, FN = Env.ENV, Env.FN
 
 -- Capture kinds after resolving the child's cell layout
 local VALUE = 0 -- register copied by value
@@ -52,11 +54,58 @@ local function Captured(S: { any }, kind: number, source: number): any
 	return cell
 end
 
+-- DynamicEnv closure creation: the closure inherits its creator's environment and is registered for getfenv.
+-- @param Reuse boolean – DUPCLOSURE: reuse the last closure while environment and captured values are unchanged
+local function Dynamic(A: number, Make: Factory, Kinds: { number }, Sources: { number }, Next: Handler, Chain: boolean, Dyn: Env.State, Reuse: boolean): Handler
+	local n = #Kinds
+	local owners = Dyn.Owners
+	local cached: any = nil
+	local cachedU: { any } = NO_UPVALUES
+	local reusable = Reuse
+	for i = 1, n do
+		if Kinds[i] ~= VALUE and Kinds[i] ~= UPVALUE then
+			reusable = false
+		end
+	end
+	return function(S)
+		local env = S[1][ENV]
+		if reusable and cached ~= nil and cachedU[ENV] == env then
+			S[A] = cached
+			local same = true
+			for i = 1, n do
+				local source = Sources[i]
+				local v = if Kinds[i] == VALUE then S[source] else S[1][source]
+				if not rawequal(cachedU[i], v) then
+					same = false
+					break
+				end
+			end
+			if same then
+				return if Chain then Next(S) else Next
+			end
+		end
+		local U = create(n)
+		local fn = Make(U)
+		U[ENV] = env
+		U[FN] = fn
+		owners[fn] = U
+		S[A] = fn
+		for i = 1, n do
+			U[i] = Captured(S, Kinds[i], Sources[i])
+		end
+		cached, cachedU = fn, U
+		return if Chain then Next(S) else Next
+	end
+end
+
 -- NEWCLOSURE: always creates a fresh closure.
 -- Single captures (the common case) are written out per kind; the closure is stored before its captures are read
 -- so a function capturing itself by value sees the closure.
-function Closures.New(A: number, Make: Factory, Kinds: { number }, Sources: { number }, Next: Handler, Chain: boolean): Handler
+function Closures.New(A: number, Make: Factory, Kinds: { number }, Sources: { number }, Next: Handler, Chain: boolean, Dyn: Env.State?): Handler
 	local n = #Kinds
+	if Dyn then
+		return Dynamic(A, Make, Kinds, Sources, Next, Chain, Dyn, false)
+	end
 	if n == 0 then
 		return function(S)
 			S[A] = Make(NO_UPVALUES)
@@ -98,8 +147,11 @@ function Closures.New(A: number, Make: Factory, Kinds: { number }, Sources: { nu
 end
 
 -- DUPCLOSURE: reuses the previous closure while its captured values are unchanged, like the host does.
-function Closures.Dup(A: number, Make: Factory, Kinds: { number }, Sources: { number }, Next: Handler, Chain: boolean): Handler
+function Closures.Dup(A: number, Make: Factory, Kinds: { number }, Sources: { number }, Next: Handler, Chain: boolean, Dyn: Env.State?): Handler
 	local n = #Kinds
+	if Dyn then
+		return Dynamic(A, Make, Kinds, Sources, Next, Chain, Dyn, true)
+	end
 	local cached: any = nil
 	local cachedU: { any } = NO_UPVALUES
 

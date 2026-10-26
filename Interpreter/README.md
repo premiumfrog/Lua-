@@ -11,9 +11,20 @@ local Interpreter = require(path.to.Interpreter.src)
 local main = Interpreter.Load(bytecode, getfenv(), {
 	SafeEnv = true, -- resolve imports such as math.floor once, at load time (default)
 	ChunkName = "[string \"MyChunk\"]", -- error()/assert() and method-call errors get "MyChunk:line:" positions
+	DynamicEnv = false, -- per-closure environments with getfenv/setfenv (default off)
+	Debug = false, -- host-exact error positions and garbage collection timing (default off)
 })
 print(main(...))
 ```
+
+### Options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `SafeEnv` | `true` | Imports such as `math.floor` resolve once at load. Turn it off when globals are replaced after loading. |
+| `ChunkName` | none | Prefix for guest error positions (`name:line:`). |
+| `DynamicEnv` | `false` | Every closure carries its own environment. Guest code gets `getfenv`/`setfenv` with the host's semantics: numeric levels, function targets, level 0 as the thread's globals, the host's error messages, and imports re-resolving once an environment has been exposed. Pass `true`, or a state from `Interpreter.NewEnvState()` to share one between chunks. |
+| `Debug` | `false` | Errors the host raises inside handlers ("attempt to call a nil value", arithmetic on nil) get the guest position, and no handler keeps a value alive after the guest stops referencing it, so weak tables clear exactly as they do natively. It returns to a trampoline after every instruction and tracks the current instruction, which makes the benchmark workloads 1.6 to 1.9 times slower. |
 
 `bytecode` is the output of `luau-compile --binary` or `luau_compile`, as a string or a buffer. Line positions need
 line info, so compile with `-g1`. `Interpreter.Deserialize` exposes the parser for tooling.
@@ -22,11 +33,12 @@ line info, so compile with `-g1`. `Interpreter.Deserialize` exposes the parser f
 
 | Module | Responsibility |
 | --- | --- |
-| `init` | Public API: `Load` and `Deserialize` |
+| `init` | Public API: `Load`, `NewEnvState` and `Deserialize` |
 | `Deserializer` | Bytecode parsing into protos (constants, imports, children, line info) |
 | `Analysis` | Per-proto control flow and dataflow analysis, producing the plan the compiler builds from |
 | `Compiler` | Maps every planned instruction to its handler maker, back to front |
 | `Runtime` | Frame pools, the function trampoline, the return protocol and upvalue cells |
+| `Env` | `DynamicEnv` state: VM-aware `getfenv`/`setfenv`, stack levels, `Debug` error repositioning |
 | `Ops/*` | Handler makers grouped by kind: values, arithmetic, tables, calls, branches, loops, closures |
 | `Ops/Fused` | Generated handlers for hot instruction pairs (`tools/gen_fused.py`) |
 
@@ -85,28 +97,40 @@ python3 tools/embed.py luau-compile build/bench 2 bench/workloads/*.luau
 luau -O2 tools/bench.luau -a build/bench fib nbody sort --ref build/RefVM
 ```
 
-## Conformance
+## Tests
 
-`tools/conformance.py <luau> <luau-compile> <level>` runs `tests/conformance` through the interpreter, one process per
-test. Tests that fail natively in the CLI runner are skipped. These include tests that need a writable global table,
-the C test API, or a top-level yield. At O0, O1 and O2, 25 tests pass and these 4 fail:
+`python3 tests/run.py <luau> <luau-compile>` runs everything at O0, O1 and O2, in the default (fast) configuration and
+with `Debug`. CI runs it on every change (`.github/workflows/interpreter.yml`).
 
-* `events` and `locals` use `getfenv`/`setfenv` on interpreted functions.
-* `tmerror` expects a position on an error raised by the host itself ("attempt to call a nil value").
-* `calls` overflows memory instead of reporting "too many results to unpack" for 19000 nested calls with 4000
-  arguments each.
+* **Conformance.** The repository's own `tests/conformance` suite, run natively and through the interpreter in the
+  environment `tests/Conformance.test.cpp` gives each test: its own thread with fresh writable globals, `loadstring`
+  bound to the thread's globals, and `limitedstack` set (interpreted calls keep their frames on the heap, so deep
+  recursion stress runs out of memory rather than stack, like the ASAN and debug builds the flag exists for). Tests
+  using `getfenv`/`setfenv` load with `DynamicEnv`. All 37 tests that run natively under the CLI pass at every level
+  with `Debug`. In the fast configuration, `tmerror` (positions on host-raised errors) and `closure` (weak-table
+  collection timing) are not run, and the other 35 pass.
+* **Skipped conformance tests.** 20 tests fail natively under the CLI because they need the C++ test host: native
+  code generation, userdata and light userdata constructors, coverage and debugger hooks, `collectgarbage` options,
+  or running on the main thread. `classes` and `jit_inliner` need compiler flags.
+* **Interpreter tests.** `tests/unit` covers what the interpreter rewrites: environments, error positions, collection
+  timing, coroutines, metamethods and host callbacks, control flow, calls and varargs, globals and values. Each test
+  must pass natively too, so it only checks real Luau behavior. A `-- interpreter: debug-only` line limits a test to
+  `Debug`, and `-- interpreter: unsafe-env` loads it with `SafeEnv` off.
+
+`tools/conformance.py` runs one suite at one level (`--mode fast|debug`, `--dir`, `--strict`, test names).
 
 ## Limitations
 
-* `getfenv`/`setfenv` on interpreted functions do not affect the environment they captured at load.
-* Errors raised by the host inside handlers, such as arithmetic on nil or calling a nil value, carry the handler's
-  position rather than the guest line. Guest `error()` (level 1), `assert()` and missing methods are positioned when a
-  `ChunkName` is given and the call site can be traced to an import, which covers O1 and O2 bytecode. At O0 the
-  compiler loads `error` and `assert` with `GETGLOBAL`, and those calls are unpositioned.
+* Without `DynamicEnv`, `getfenv`/`setfenv` on interpreted functions do not affect the environment they captured at
+  load.
+* Without `Debug`, errors raised by the host inside handlers, such as arithmetic on nil or calling a nil value, carry
+  the handler's position rather than the guest line. Guest `error()` (level 1), `assert()` and missing methods are
+  positioned in both modes when a `ChunkName` is given.
 * `error(message, 2)` and higher levels raise the message without a position.
 * Bytecode classes (`NEWCLASSMEMBER`) are rejected at load time.
 * With `SafeEnv` (the default), imports that resolve at load time are fixed. Turn `SafeEnv` off when globals are
   replaced after loading.
+* `debug.info` and `debug.traceback` describe the interpreter's frames, not the guest's.
 * Each proto keeps up to 17 frames for reuse, which can hold stale register values until they are reused.
 
 ## Tools
@@ -114,4 +138,4 @@ the C test API, or a top-level yield. At O0, O1 and O2, 25 tests pass and these 
 * `tools/embed.py` compiles sources and embeds them as Luau modules for the drivers.
 * `tools/gen_fused.py` regenerates `src/Ops/Fused.luau`.
 * `tools/bench.luau` is the benchmark driver.
-* `tools/conformance.py` and `tools/conformance.luau` are the conformance runner.
+* `tools/conformance.py` and `tools/conformance.luau` run one test suite; `tests/run.py` runs all of them.

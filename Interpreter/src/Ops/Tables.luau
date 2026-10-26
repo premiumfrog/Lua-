@@ -75,22 +75,37 @@ function Tables.SetK(A: number, B: number, K: any, Next: Handler, Chain: boolean
 	end
 end
 
--- NEWTABLE: presizes the array part when the constructor's size is known.
+-- NEWTABLE: presizes the table like the host's luaH_new.
+-- A hash-only constructor clones an empty presized template, so keys inserted by the constructor land in the
+-- same nodes (and iterate in the same order) as on the host.
 -- @param Size number – array size hint
-function Tables.New(A: number, Size: number, Next: Handler, Chain: boolean): Handler
-	if Size > 0 then
+-- @param HashSize number – hash size hint (0 when none)
+-- Allocating handlers clear A first: the host collects after the instruction, once A holds the new value, while
+-- here the collection step runs before the store, and the old value must not survive it.
+function Tables.New(A: number, Size: number, HashSize: number, Next: Handler, Chain: boolean): Handler
+	if HashSize > 0 and Size == 0 then
+		local template = Runtime.PresizedHash(HashSize)
 		return function(S)
+			S[A] = nil
+			S[A] = clone(template)
+			return if Chain then Next(S) else Next
+		end
+	elseif Size > 0 then
+		return function(S)
+			S[A] = nil
 			S[A] = create(Size)
 			return if Chain then Next(S) else Next
 		end
 	end
 	if Chain then
 		return function(S)
+			S[A] = nil
 			S[A] = {}
 			return Next(S)
 		end
 	end
 	return function(S)
+		S[A] = nil
 		S[A] = {}
 		return Next
 	end
@@ -101,11 +116,13 @@ end
 function Tables.Dup(A: number, Template: any, Next: Handler, Chain: boolean): Handler
 	if Chain then
 		return function(S)
+			S[A] = nil
 			S[A] = clone(Template)
 			return Next(S)
 		end
 	end
 	return function(S)
+		S[A] = nil
 		S[A] = clone(Template)
 		return Next
 	end

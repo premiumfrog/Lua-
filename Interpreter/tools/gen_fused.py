@@ -2,8 +2,8 @@
 """Generates src/Ops/Fused.luau: handlers for hot adjacent instruction pairs.
 
 Luau has no first-class operators, so each operator combination is written out. Every maker returns a chained
-or a returning handler; both instructions' effects are kept (the first result is still stored), so fusion needs
-no liveness information.
+or a returning handler; both instructions' effects are kept (the first result is still stored), except in the
+"Dead" branch variants, which Analysis selects only when the tested value is never read again.
 
 Usage: gen_fused.py > src/Ops/Fused.luau
 """
@@ -155,6 +155,10 @@ FIRSTS = {
 for first, (params, prelude, what) in FIRSTS.items():
     branch_maker(f"Fused.Branch.{first}Truthy", params, prelude, "v", f"{what} feeding JUMPIF.")
     branch_maker(f"Fused.Branch.{first}EqK", params + ["K2: any"], prelude, "v == K2", f"{what} feeding a JUMPXEQK compare.")
+    # value dead after the branch: not stored (A1 kept in the signature so makers stay interchangeable)
+    bare = prelude[:1]
+    branch_maker(f"Fused.Branch.{first}TruthyDead", params, bare, "v", f"{what} feeding JUMPIF; value not kept.")
+    branch_maker(f"Fused.Branch.{first}EqKDead", params + ["K2: any"], bare, "v == K2", f"{what} feeding a JUMPXEQK compare; value not kept.")
 
 emit("return Fused")
 print("\n".join(out))

@@ -64,6 +64,16 @@ function Values.GetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: 
 	end
 end
 
+-- GETGLOBAL of error/assert feeding a call: substitutes the call site's positioned wrapper for the real function.
+-- @param Swaps { [any]: any } – real function -> wrapper
+function Values.GetGlobalSwapped(A: number, Env: any, K: string, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
+	return function(S)
+		local v = Env[K]
+		S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
+		return if Chain then Next(S) else Next
+	end
+end
+
 -- SETGLOBAL: writes a global into the chunk environment.
 function Values.SetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: boolean): Handler
 	if Chain then
@@ -79,14 +89,15 @@ function Values.SetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: 
 end
 
 -- GETIMPORT that could not be resolved at load: walks the path on every execution.
+-- Indexing a missing step raises, as the host's run-time import fallback does.
 -- @param Path { string } – one to three keys
 function Values.GetImport(A: number, Env: any, Path: { string }, Next: Handler, Chain: boolean): Handler
 	local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
 	local function Resolve(): any
 		local v = Env[k1]
-		if count > 1 and v ~= nil then
+		if count > 1 then
 			v = v[k2]
-			if count > 2 and v ~= nil then
+			if count > 2 then
 				v = v[k3]
 			end
 		end
@@ -101,6 +112,70 @@ function Values.GetImport(A: number, Env: any, Path: { string }, Next: Handler, 
 	return function(S)
 		S[A] = Resolve()
 		return Next
+	end
+end
+
+-- DynamicEnv GETGLOBAL: reads the running closure's environment.
+-- @param ENV string – upvalue-table key of the environment
+-- @param Swaps { [any]: any }? – values replaced when read (host getfenv/setfenv, positioned error/assert)
+function Values.GetGlobalDyn(A: number, ENV: string, K: string, Swaps: { [any]: any }?, Next: Handler, Chain: boolean): Handler
+	if Swaps then
+		return function(S)
+			local v = S[1][ENV][K]
+			S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
+			return if Chain then Next(S) else Next
+		end
+	end
+	return function(S)
+		S[A] = S[1][ENV][K]
+		return if Chain then Next(S) else Next
+	end
+end
+
+-- DynamicEnv SETGLOBAL.
+function Values.SetGlobalDyn(A: number, ENV: string, K: string, Next: Handler, Chain: boolean): Handler
+	return function(S)
+		S[1][ENV][K] = S[A]
+		return if Chain then Next(S) else Next
+	end
+end
+
+-- DynamicEnv GETIMPORT: the load-time value while the closure's environment is the load environment and has
+-- never been exposed through getfenv/setfenv; otherwise the path is walked, as the host's safe-env check does.
+-- @param Resolved any – value resolved at load (nil when it was not resolvable)
+-- @param LoadEnv table – environment the value was resolved in
+-- @param Unsafe { [any]: boolean } – exposed environments
+-- @param Swaps { [any]: any }? – values replaced when read
+function Values.GetImportDyn(A: number, ENV: string, Path: { string }, Resolved: any, LoadEnv: any, Unsafe: { [any]: boolean }, Swaps: { [any]: any }?, Next: Handler, Chain: boolean): Handler
+	local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
+	return function(S)
+		local env = S[1][ENV]
+		local v
+		if Resolved ~= nil and env == LoadEnv and not Unsafe[env] then
+			v = Resolved
+		else
+			v = env[k1]
+			if count > 1 then
+				v = v[k2]
+				if count > 2 then
+					v = v[k3]
+				end
+			end
+		end
+		if Swaps and v ~= nil and Swaps[v] ~= nil then
+			v = Swaps[v]
+		end
+		S[A] = v
+		return if Chain then Next(S) else Next
+	end
+end
+
+-- GETTABLEKS of "getfenv"/"setfenv" under DynamicEnv (e.g. _G.getfenv): hands out the VM-aware versions.
+function Values.GetKSwapped(A: number, B: number, K: string, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
+	return function(S)
+		local v = S[B][K]
+		S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
+		return if Chain then Next(S) else Next
 	end
 end
 
