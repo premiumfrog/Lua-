@@ -1,6 +1,6 @@
 # Luau bytecode interpreter in Luau
 
-This interpreter runs Luau bytecode (versions 3 to 14, type version 3) on any Luau host, including Roblox. It loads the
+This interpreter runs Luau bytecode (versions 3 to 14 and the experimental class version 100, type version 3) on any Luau host, including Roblox. It loads the
 bytecode once and turns it into graphs of host closures, so running it involves no opcode dispatch. It is a rework of the
 handler-closure design used by [vantoanvh/LuauVM](https://github.com/vantoanvh/LuauVM), and it is faster on all
 17 workloads in the benchmark suite (1.38x geometric mean).
@@ -38,6 +38,7 @@ line info, so compile with `-g1`. `Interpreter.Deserialize` exposes the parser f
 | `Analysis` | Per-proto control flow and dataflow analysis, producing the plan the compiler builds from |
 | `Compiler` | Maps every planned instruction to its handler maker, back to front |
 | `Runtime` | Frame pools, the function trampoline, the return protocol and upvalue cells |
+| `Classes` | Luau classes: class values, instances, inheritance, private members and the `class` library |
 | `Env` | `DynamicEnv` state: VM-aware `getfenv`/`setfenv`, stack levels, `Debug` error repositioning |
 | `Ops/*` | Handler makers grouped by kind: values, arithmetic, tables, calls, branches, loops, closures |
 | `Ops/Fused` | Generated handlers for hot instruction pairs (`tools/gen_fused.py`) |
@@ -106,12 +107,13 @@ with `Debug`. CI runs it on every change (`.github/workflows/interpreter.yml`).
   environment `tests/Conformance.test.cpp` gives each test: its own thread with fresh writable globals, `loadstring`
   bound to the thread's globals, and `limitedstack` set (interpreted calls keep their frames on the heap, so deep
   recursion stress runs out of memory rather than stack, like the ASAN and debug builds the flag exists for). Tests
-  using `getfenv`/`setfenv` load with `DynamicEnv`. All 37 tests that run natively under the CLI pass at every level
-  with `Debug`. In the fast configuration, `tmerror` (positions on host-raised errors) and `closure` (weak-table
-  collection timing) are not run, and the other 35 pass.
-* **Skipped conformance tests.** 20 tests fail natively under the CLI because they need the C++ test host: native
+  using `getfenv`/`setfenv` load with `DynamicEnv`, and `classes` is compiled and run with the class fast flags
+  `Conformance.test.cpp` sets. All 38 tests that run natively under the CLI pass at every level with `Debug`. In the
+  fast configuration, `tmerror` (positions on host-raised errors) and `closure` (weak-table collection timing) are
+  not run, and the other 36 pass.
+* **Skipped conformance tests.** 18 tests fail natively under the CLI because they need the C++ test host: native
   code generation, userdata and light userdata constructors, coverage and debugger hooks, `collectgarbage` options,
-  or running on the main thread. `classes` and `jit_inliner` need compiler flags.
+  or running on the main thread. `jit_inliner` needs a compiler flag for the native inliner.
 * **Interpreter tests.** `tests/unit` covers what the interpreter rewrites: environments, error positions, collection
   timing, coroutines, metamethods and host callbacks, control flow, calls and varargs, globals and values. Each test
   must pass natively too, so it only checks real Luau behavior. A `-- interpreter: debug-only` line limits a test to
@@ -127,7 +129,10 @@ with `Debug`. CI runs it on every change (`.github/workflows/interpreter.yml`).
   the handler's position rather than the guest line. Guest `error()` (level 1), `assert()` and missing methods are
   positioned in both modes when a `ChunkName` is given.
 * `error(message, 2)` and higher levels raise the message without a position.
-* Bytecode classes (`NEWCLASSMEMBER`) are rejected at load time.
+* Class values and instances are tables behind protected metatables, because Luau code cannot create new value
+  types. In class chunks, `type`, `typeof` and `getmetatable` are swapped for class-aware versions and `class` is
+  the interpreter's own library, so guest code sees `"class"`/`"object"` and the host's error messages. Raw access
+  (`rawget`, `next`) and the default `tostring` address differ from the host's.
 * With `SafeEnv` (the default), imports that resolve at load time are fixed. Turn `SafeEnv` off when globals are
   replaced after loading.
 * `debug.info` and `debug.traceback` describe the interpreter's frames, not the guest's.

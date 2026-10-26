@@ -6,6 +6,7 @@
 
 local Types = require("./Types")
 local Runtime = require("./Runtime")
+local Classes = require("./Classes")
 
 local PresizedHash = Runtime.PresizedHash
 
@@ -83,7 +84,7 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 	local version = u8()
 	if version == 0 then
 		error(readstring(stream, 1, size - 1), 0)
-	elseif version < 3 or version > 14 then
+	elseif (version < 3 or version > 14) and version ~= 100 then
 		error(`unsupported bytecode version {version}`, 0)
 	end
 	local typesVersion = if version >= 4 then u8() else 0
@@ -101,6 +102,8 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 			varint()
 		end
 	end
+
+	local hasClasses = false
 
 	local protoCount = varint()
 	local protos: { Proto } = table.create(protoCount)
@@ -170,7 +173,19 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 				until b < 128
 				constants[k] = MakeInteger(groups, negative)
 			elseif kind == K_CLASS_SHAPE then
-				error("class bytecode is not supported", 0)
+				-- the class is created once per load, as the host loader does; NEWCLASS hands out this value
+				local name = constants[varint() + 1]
+				local privateFields, privateMethods = u8(), u8()
+				local properties, methods = varint(), varint()
+				local fields, names = {}, {}
+				for i = 1, properties - privateFields do
+					fields[i] = constants[varint() + 1]
+				end
+				for i = 1, methods - privateMethods do
+					names[i] = constants[varint() + 1]
+				end
+				constants[k] = Classes.FromShape(name, fields, names, privateFields, privateMethods)
+				hasClasses = true
 			else
 				error(`unknown constant kind {kind}`, 0)
 			end
@@ -240,10 +255,15 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 			end
 		end
 
-		if version >= 11 then -- feedback slots
-			for _ = 1, varint() do
-				u8()
-				varint()
+		-- feedback slots: call targets (unused here) and CONSTRUCT shapes (constant index of the table template)
+		local shapes: { [number]: number } = {}
+		if version >= 11 then
+			for slot = 0, varint() - 1 do
+				local kind = u8()
+				local value = varint()
+				if kind == 1 then
+					shapes[slot] = value + 1
+				end
 			end
 		end
 
@@ -264,6 +284,7 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 			Children = children,
 			Name = debugName,
 			Lines = lines,
+			Shapes = shapes,
 		}
 	end
 
@@ -272,7 +293,7 @@ local function Deserialize(input: string | buffer, vectorCtor: (number, number, 
 		error("malformed bytecode: trailing data", 0)
 	end
 
-	return { Protos = protos, Main = main }
+	return { Protos = protos, Main = main, HasClasses = hasClasses }
 end
 
 return Deserialize

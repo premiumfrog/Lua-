@@ -22,6 +22,12 @@ TESTS = os.path.join(ROOT, "..", "tests", "conformance")
 # values the guest no longer references while chained handlers are still running (closure). Not run in fast mode.
 NEEDS_DEBUG = {"closure", "tmerror"}
 
+# Tests for features behind fast flags, as tests/Conformance.test.cpp enables them; passed to compiler and runtime.
+FFLAGS = {
+    "classes": "DebugLuauUserDefinedClasses=true,DebugLuauUserDefinedClassesRuntime=true,"
+               "LuauEmitCallFeedback=true,LuauBytecodeCostModel=true",
+}
+
 
 def main() -> None:
     luau, compiler, level = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -44,8 +50,13 @@ def main() -> None:
                   if "-- interpreter: debug-only" in open(p, encoding="utf-8", errors="replace").read()}
     for stale in glob.glob(os.path.join(ROOT, out_dir, "*.luau")):
         os.remove(stale)
-    subprocess.run([sys.executable, os.path.join(HERE, "embed.py"), compiler, os.path.join(ROOT, out_dir), level, *sources],
-                   check=True, stderr=subprocess.DEVNULL)
+    flagged = [p for p in sources if os.path.splitext(os.path.basename(p))[0] in FFLAGS]
+    plain = [p for p in sources if p not in flagged]
+    embed = [sys.executable, os.path.join(HERE, "embed.py"), compiler, os.path.join(ROOT, out_dir), level]
+    subprocess.run([*embed, *plain], check=True, stderr=subprocess.DEVNULL)
+    for path in flagged:
+        name = os.path.splitext(os.path.basename(path))[0]
+        subprocess.run([*embed, f"--fflags={FFLAGS[name]}", path], check=True, stderr=subprocess.DEVNULL)
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
     for path in sources:
         name = os.path.splitext(os.path.basename(path))[0]
@@ -60,7 +71,8 @@ def main() -> None:
             counts["SKIP"] += 1
             continue
         try:
-            run = subprocess.run([luau, os.path.join(HERE, "conformance.luau"), "-a", out_dir, name, mode],
+            flags = [f"--fflags={FFLAGS[name]}"] if name in FFLAGS else []
+            run = subprocess.run([luau, *flags, os.path.join(HERE, "conformance.luau"), "-a", out_dir, name, mode],
                                  cwd=ROOT, capture_output=True, text=True, timeout=120)
             lines = [l for l in run.stdout.splitlines() if l.startswith(("PASS", "FAIL", "SKIP"))]
             # a crash before any verdict happens in the native run (e.g. a top-level yield)

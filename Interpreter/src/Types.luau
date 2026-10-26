@@ -16,11 +16,13 @@ export type Proto = {
 	Children: { number }, -- child proto indices (NEWCLOSURE)
 	Name: string?,
 	Lines: { number }?, -- source line per code word, when compiled with line info
+	Shapes: { [number]: number }, -- CONSTRUCT feedback slot -> constant index (1-based) of its table template
 }
 
 export type Chunk = {
 	Protos: { Proto },
 	Main: number,
+	HasClasses: boolean, -- class bytecode: type/typeof/getmetatable and `class` reads become class-aware
 }
 
 -- Register file of one activation: [1] upvalues, [2] varargs, [3] vararg count / result kind, [4] open cells, [5] top, registers from [6].

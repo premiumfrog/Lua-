@@ -115,6 +115,26 @@ function Values.GetImport(A: number, Env: any, Path: { string }, Next: Handler, 
 	end
 end
 
+-- GETIMPORT walked per access, with values replaced when read (class-aware builtins).
+-- @param Swaps { [any]: any } – host value -> replacement
+function Values.GetImportSwapped(A: number, Env: any, Path: { string }, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
+	local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
+	return function(S)
+		local v = Env[k1]
+		if count > 1 then
+			v = v[k2]
+			if count > 2 then
+				v = v[k3]
+			end
+		end
+		if v ~= nil and Swaps[v] ~= nil then
+			v = Swaps[v]
+		end
+		S[A] = v
+		return if Chain then Next(S) else Next
+	end
+end
+
 -- DynamicEnv GETGLOBAL: reads the running closure's environment.
 -- @param ENV string – upvalue-table key of the environment
 -- @param Swaps { [any]: any }? – values replaced when read (host getfenv/setfenv, positioned error/assert)

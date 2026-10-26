@@ -44,7 +44,7 @@ local Op = {
 	COVERAGE = 69, CAPTURE = 70, SUBRK = 71, DIVRK = 72, FASTCALL1 = 73, FASTCALL2 = 74, FASTCALL2K = 75,
 	FORGPREP = 76, JUMPXEQKNIL = 77, JUMPXEQKB = 78, JUMPXEQKN = 79, JUMPXEQKS = 80, IDIV = 81, IDIVK = 82,
 	GETUDATAKS = 83, SETUDATAKS = 84, NAMECALLUDATA = 85, NEWCLASSMEMBER = 86, CALLFB = 87, CMPPROTO = 88,
-	FASTPCALL = 89,
+	FASTPCALL = 89, NEWCLASS = 90, CONSTRUCT = 91, FINCONSTRUCT = 92, GETPRIVATEFIELD = 93, SETPRIVATEFIELD = 94,
 }
 
 local function Set(list: { number }): { [number]: boolean }
@@ -59,7 +59,9 @@ end
 local HAS_AUX = Set({ 7, 8, 12, 15, 16, 20, 27, 28, 29, 30, 31, 32, 53, 55, 58, 60, 66, 74, 75, 77, 78, 79, 80, 83, 84, 85, 86, 87, 88, 90, 91, 93, 94 })
 
 -- No runtime effect here. Fast calls are hints: the CALL they guard still runs (and is specialized on its own).
-local REMOVED = Set({ 0, 1, 60, 62, 65, 68, 69, 70, 73, 74, 75, 89 })
+-- FINCONSTRUCT only skips the CALL after a CONSTRUCT that built the instance itself; CONSTRUCT here always leaves
+-- the property table, so the CALL constructs (the host's own fallback path).
+local REMOVED = Set({ 0, 1, 60, 62, 65, 68, 69, 70, 73, 74, 75, 89, 92 })
 
 -- Unconditional jumps; CMPPROTO never matches a host closure, so it always takes its jump.
 local PURE_JUMP = Set({ Op.JUMP, Op.JUMPBACK, Op.JUMPX, Op.CMPPROTO })
@@ -178,7 +180,8 @@ end
 -- @param safeEnv boolean – whether imports may be resolved once, here
 -- @param noChain boolean? – return every edge to a trampoline (Debug mode: no host frame outlives its handler, so
 -- the GC sees only the guest registers, as on the host)
-function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: boolean, noChain: boolean?): Program
+-- @param resolve ((path) -> any)? – resolves an import at load in place of the environment walk (class chunks)
+function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: boolean, noChain: boolean?, resolve: (({ any }) -> any)?): Program
 	local code = proto.Code
 	local K = proto.Constants
 	local size = #code
@@ -457,12 +460,14 @@ function Analysis.Analyze(proto: Proto, cells: { boolean }, env: any, safeEnv: b
 
 	local imports: { [number]: any } = {}
 	local function ImportValue(pc: number): any
-		if not safeEnv then
-			return nil
-		end
 		local value = imports[pc]
 		if value == nil then
-			value = ResolveImport(env, Analysis.ImportPath(K, Aux[pc]))
+			local path = Analysis.ImportPath(K, Aux[pc])
+			if resolve then
+				value = resolve(path)
+			elseif safeEnv then
+				value = ResolveImport(env, path)
+			end
 			imports[pc] = value
 		end
 		return value

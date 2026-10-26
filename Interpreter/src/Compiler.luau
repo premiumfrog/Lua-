@@ -20,6 +20,8 @@ local Loops = require("./Ops/Loops")
 local Closures = require("./Ops/Closures")
 local Env = require("./Env")
 local Fused = require("./Ops/Fused")
+local Objects = require("./Ops/Objects")
+local Classes = require("./Classes")
 
 type Proto = Types.Proto
 type Chunk = Types.Chunk
@@ -52,6 +54,7 @@ type Context = {
 	ChunkName: string?,
 	Dyn: Env.State?, -- DynamicEnv state; nil binds globals to Env at load
 	Debug: boolean, -- track the running pc so host-raised errors carry guest positions
+	Classes: boolean, -- class bytecode: class-aware builtins and the `class` library
 }
 
 -- Decides which upvalues of every proto are shared cells; a child slot is a cell when any capture site passes a
@@ -176,7 +179,24 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 	local env = ctx.Env
 	local K = proto.Constants
 	local dyn = ctx.Dyn
-	local prog = Analysis.Analyze(proto, cells, env, ctx.SafeEnv and dyn == nil, ctx.Debug)
+	local safe = ctx.SafeEnv and dyn == nil
+
+	-- class chunks: `class` is the interpreter's library, and type/typeof/getmetatable resolve to class-aware versions
+	local ClassRoot = { class = Classes.Library }
+	local function ResolveClassImport(path: { any }): any
+		if path[1] == "class" then
+			return Analysis.ResolveImport(ClassRoot, path)
+		elseif not safe then
+			return nil
+		end
+		local value = Analysis.ResolveImport(env, path)
+		if value ~= nil and Classes.Swaps[value] ~= nil then
+			value = Classes.Swaps[value]
+		end
+		return value
+	end
+
+	local prog = Analysis.Analyze(proto, cells, env, safe, ctx.Debug, if ctx.Classes then ResolveClassImport else nil)
 
 	local OpOf, OA, OB, OC, OD, Aux, Len = prog.Op, prog.A, prog.B, prog.C, prog.D, prog.Aux, prog.Len
 	local base = prog.Base
@@ -202,6 +222,12 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		local swaps: { [any]: any }? = nil
 		if dyn then
 			swaps = { [Env.HostGetfenv] = dyn.getfenv, [Env.HostSetfenv] = dyn.setfenv }
+		end
+		if ctx.Classes then
+			swaps = swaps or {}
+			for host, replacement in Classes.Swaps do
+				(swaps :: any)[host] = replacement
+			end
 		end
 		local site = prog.Positioned[pc]
 		local where = if site then Where(site) else ""
@@ -497,14 +523,15 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			return Values.LoadK(A, K[Aux[pc] + 1], nextH, chain)
 		elseif op == Op.MOVE then
 			return Values.Move(A, B + base, nextH, chain)
+		elseif op == Op.GETGLOBAL and ctx.Classes and K[Aux[pc] + 1] == "class" then
+			return Values.LoadK(A, Classes.Library, nextH, chain)
 		elseif op == Op.GETGLOBAL and dyn then
 			return Values.GetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], Swaps(pc), nextH, chain)
 		elseif op == Op.GETGLOBAL then
-			local site = prog.Positioned[pc]
-			local where = if site then Where(site) else ""
-			if where ~= "" then
-				-- the global may be replaced at any time, so the swap for a positioned wrapper happens per read
-				return Values.GetGlobalSwapped(A, env, K[Aux[pc] + 1], { [error] = GuestError(where), [assert] = GuestAssert(where) }, nextH, chain)
+			-- the global may be replaced at any time, so swaps (positioned error/assert, class builtins) happen per read
+			local swaps = Swaps(pc)
+			if swaps then
+				return Values.GetGlobalSwapped(A, env, K[Aux[pc] + 1], swaps, nextH, chain)
 			end
 			return Values.GetGlobal(A, env, K[Aux[pc] + 1], nextH, chain)
 		elseif op == Op.SETGLOBAL then
@@ -521,6 +548,8 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			return Values.SetUpval(A, B + 1, cells[B + 1] == true, nextH, chain)
 		elseif op == Op.CLOSEUPVALS then
 			return Values.CloseUpvals(A, nextH, chain)
+		elseif op == Op.GETIMPORT and ctx.Classes and Analysis.ImportPath(K, Aux[pc])[1] == "class" then
+			return Values.LoadK(A, ResolveClassImport(Analysis.ImportPath(K, Aux[pc])), nextH, chain)
 		elseif op == Op.GETIMPORT and dyn then
 			local path = Analysis.ImportPath(K, Aux[pc])
 			local resolved = if ctx.SafeEnv and not dyn.Unsafe[env] then Analysis.ResolveImport(env, path) else nil
@@ -532,6 +561,9 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 				if value == nil then
 					value = Analysis.ResolveImport(env, path)
 				end
+				if ctx.Classes and value ~= nil and Classes.Swaps[value] ~= nil then
+					value = Classes.Swaps[value]
+				end
 				local site = prog.Positioned[pc]
 				local where = if site then Where(site) else ""
 				if where ~= "" and (rawequal(value, error) or rawequal(value, assert)) then
@@ -540,6 +572,10 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 				if value ~= nil then
 					return Values.LoadK(A, value, nextH, chain)
 				end
+			end
+			local swaps = Swaps(pc)
+			if swaps then
+				return Values.GetImportSwapped(A, env, path, swaps, nextH, chain)
 			end
 			return Values.GetImport(A, env, path, nextH, chain)
 		elseif op == Op.GETTABLE then
@@ -566,6 +602,22 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 			return Tables.New(A, Aux[pc], if B == 0 then 0 else bit32.lshift(1, B - 1), nextH, chain)
 		elseif op == Op.DUPTABLE then
 			return Tables.Dup(A, K[D + 1], nextH, chain)
+		elseif op == Op.CONSTRUCT then
+			-- the property table the CALL after it passes to the class (or to any other callee)
+			local shape = proto.Shapes[Aux[pc]]
+			assert(shape, "CONSTRUCT without a feedback shape")
+			return Tables.Dup(A, K[shape], nextH, chain)
+		elseif op == Op.NEWCLASS then
+			return Objects.NewClass(A, K[Aux[pc] + 1], if B == 0xFF then nil else B + base, band(C, 1) == 1, nextH, chain)
+		elseif op == Op.NEWCLASSMEMBER then
+			local aux = Aux[pc]
+			local public = band(B, 1) == 0
+			return Objects.NewMember(A, if public then K[aux + 1] else nil, band(aux, 0xFF), C + base, nextH, chain)
+		elseif op == Op.GETPRIVATEFIELD then
+			local aux = Aux[pc]
+			return Objects.GetPrivate(A, B + base, C + 1, cells[C + 1] == true, band(aux, 0xFF), band(rshift(aux, 8), 1) == 1, band(rshift(aux, 9), 1) == 1, nextH, chain)
+		elseif op == Op.SETPRIVATEFIELD then
+			return Objects.SetPrivate(A, B + base, C + 1, cells[C + 1] == true, band(Aux[pc], 0xFF), nextH, chain)
 		elseif op == Op.SETLIST then
 			if C == 0 then
 				return Tables.SetListAll(A, B + base, Aux[pc], nextH, chain)
@@ -700,6 +752,7 @@ function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: s
 		ChunkName = chunkName,
 		Dyn = dyn,
 		Debug = debug == true,
+		Classes = chunk.HasClasses,
 	}
 
 	-- children before parents, so closure makers can capture their child's factory directly
@@ -732,7 +785,7 @@ function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: s
 end
 
 -- interpreter frames are invisible to guest stack levels (getfenv/setfenv under DynamicEnv)
-for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler } do
+for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler, Objects, Classes } do
 	for _, member in module :: any do
 		if type(member) == "function" then
 			Env.MarkInternal(member)

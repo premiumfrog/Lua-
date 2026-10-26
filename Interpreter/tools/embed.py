@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compiles Luau sources to bytecode and embeds them as Luau modules for the test and benchmark drivers.
 
-Usage: embed.py <luau-compile> <out-dir> <opt-level> <file>...
+Usage: embed.py <luau-compile> <out-dir> <opt-level> [--fflags=<flags>] <file>...
 Each <file> becomes <out-dir>/<stem>.luau returning { Source = string, Bytecode = string }.
 """
 import os
@@ -21,10 +21,13 @@ def quote(data: bytes) -> str:
 
 def main() -> None:
     compiler, out_dir, level = sys.argv[1], sys.argv[2], sys.argv[3]
+    files = sys.argv[4:]
+    flags = [f for f in files if f.startswith("--fflags=")]
+    files = [f for f in files if not f.startswith("--fflags=")]
     os.makedirs(out_dir, exist_ok=True)
-    for path in sys.argv[4:]:
+    for path in files:
         source = open(path, "rb").read()
-        result = subprocess.run([compiler, "--binary", f"-O{level}", "-g1", path], capture_output=True)
+        result = subprocess.run([compiler, *flags, "--binary", f"-O{level}", "-g1", path], capture_output=True)
         if result.returncode != 0:
             print(f"skipped {path}: does not compile", file=sys.stderr)
             continue
