@@ -49,32 +49,6 @@ export type Options = {
 	Debug: boolean?, -- position host-raised errors (arithmetic on nil, calling nil) at the guest line; slower
 }
 
-export type EnvState = {
-	Unsafe: { [any]: boolean }, -- environments exposed through getfenv/setfenv; their imports resolve per access
-	Owners: { [any]: { any } }, -- VM closure -> its upvalue table
-	getfenv: (any?) -> any,
-	setfenv: (any, any) -> any,
-}
-
-export type Class = {
-	Name: string,
-	Id: number,
-	IsOpen: boolean,
-	Super: Class?,
-	Members: { [any]: number }, -- public member name -> offset
-	Names: { [number]: string }, -- offset -> name; private fields and private methods have none
-	NInstance: number,
-	NMembers: number,
-	NPrivateFields: number,
-	OwnPrivateStart: number,
-	NPrivateStatics: number,
-	Statics: { any }, -- static offset + 1 -> value; private methods occupy the last NPrivateStatics slots
-	HasUserInit: boolean,
-	InstanceMeta: { [string]: any }?, -- user metamethods, inherited by subclasses
-	ObjectMeta: { [any]: any }, -- metatable of instances
-	Proxy: { [any]: any }, -- the guest-visible class value
-}
-
 export type Loop = {
 	Kind: "numeric" | "generic" | "back",
 	Head: number, -- pc owning the loop handler
@@ -134,6 +108,32 @@ export type Program = {
 	Consts: { any },
 	ConstCount: number,
 	Base: number, -- frame index of register 0
+}
+
+export type Class = {
+	Name: string,
+	Id: number,
+	IsOpen: boolean,
+	Super: Class?,
+	Members: { [any]: number }, -- public member name -> offset
+	Names: { [number]: string }, -- offset -> name; private fields and private methods have none
+	NInstance: number,
+	NMembers: number,
+	NPrivateFields: number,
+	OwnPrivateStart: number,
+	NPrivateStatics: number,
+	Statics: { any }, -- static offset + 1 -> value; private methods occupy the last NPrivateStatics slots
+	HasUserInit: boolean,
+	InstanceMeta: { [string]: any }?, -- user metamethods, inherited by subclasses
+	ObjectMeta: { [any]: any }, -- metatable of instances
+	Proxy: { [any]: any }, -- the guest-visible class value
+}
+
+export type EnvState = {
+	Unsafe: { [any]: boolean }, -- environments exposed through getfenv/setfenv; their imports resolve per access
+	Owners: { [any]: { any } }, -- VM closure -> its upvalue table
+	getfenv: (any?) -> any,
+	setfenv: (any, any) -> any,
 }
 
 -- Runtime.luau
@@ -399,1006 +399,6 @@ local Module_Runtime = (function()
 	end
 
 	return Runtime
-end)()
-
--- Env.luau
-local Module_Env = (function()
-	-- Dynamic environments: getfenv/setfenv with the host's semantics, enabled by the DynamicEnv load option.
-	-- Why: by default globals bind to one environment at load time, which is fastest; code that swaps environments
-	-- needs every closure to carry its own environment and imports to re-resolve once an environment is exposed.
-	--
-	-- Each VM closure's upvalue table holds its environment under ENV and the closure itself under FN. Numeric levels
-	-- walk the host call stack: VM closures are real host functions there, interpreter internals are skipped, and
-	-- other functions (pcall, host callbacks) count as levels, as they do on the host.
-
-
-	local hostGetfenv = getfenv
-	local hostSetfenv = setfenv
-	local info = debug.info
-
-	-- Upvalue-table keys of a closure's environment and of the closure itself
-	local ENV, FN = "\0env", "\0fn"
-
-	-- Sources of interpreter modules; their frames are invisible to guest levels
-	local internal: { [string]: boolean } = {}
-	-- Interpreter functions run through a host pcall; that pcall's frame is invisible too
-	local guarded: { [any]: boolean } = {}
-
-	local Env = {}
-
-	Env.ENV = ENV
-	Env.FN = FN
-	Env.HostGetfenv = hostGetfenv
-	Env.HostSetfenv = hostSetfenv
-
-	-- Marks the module defining a function as interpreter-internal.
-	-- @param fn function – any function defined in that module
-	function Env.MarkInternal(fn: (...any) -> ...any)
-		internal[info(fn, "s")] = true
-	end
-
-	-- Marks an interpreter function the interpreter itself calls through pcall (Debug mode).
-	-- @param fn function – function passed to pcall
-	function Env.MarkGuarded(fn: (...any) -> ...any)
-		guarded[fn] = true
-	end
-
-	-- Replaces the position an interpreter module put on an error message with the guest's.
-	-- Why: Debug mode reports host-raised errors (calling nil, arithmetic on nil) at the guest line, as the host VM does.
-	-- @param message any – caught error value; non-strings and guest-positioned messages pass through
-	-- @param where string – guest "chunk:line: " prefix, or "" to drop the internal one
-	function Env.Reposition(message: any, where: string): any
-		if type(message) ~= "string" then
-			return message
-		end
-		local src, rest = string.match(message, "^(.-):%d+: (.*)$")
-		if src and internal[src] then
-			return where .. rest
-		end
-		return message
-	end
-
-	-- Function at a guest-visible stack level (1 = the function calling getfenv/setfenv); nil past the stack.
-	-- @param owners { [any]: any } – VM closures (defined in an internal module, yet guest-visible)
-	local function AtLevel(owners: { [any]: any }, level: number): any
-		local seen = 0
-		local i = 2 -- 1 is AtLevel's caller in this module
-		local skip = false
-		while true do
-			local fn = info(i, "f")
-			if fn == nil then
-				return nil
-			end
-			if skip then
-				skip = false
-			elseif guarded[fn] then
-				skip = true
-			elseif owners[fn] ~= nil or not internal[info(i, "s")] then
-				seen += 1
-				if seen == level then
-					return fn
-				end
-			end
-			i += 1
-		end
-	end
-
-	-- Creates a dynamic environment state. Level 0 is the running thread's globals, as on the host.
-	function Env.New(): EnvState
-		local state: EnvState
-		state = {
-			Unsafe = setmetatable({}, { __mode = "k" }) :: any,
-			Owners = setmetatable({}, { __mode = "k" }) :: any,
-			getfenv = nil :: any,
-			setfenv = nil :: any,
-		}
-
-		-- Environment of a function: its upvalue table's for VM closures; the thread's globals for C functions (the
-		-- VM-aware getfenv/setfenv stand in for C functions); the host's otherwise.
-		local function EnvOf(fn: any): any
-			local U = state.Owners[fn]
-			if U then
-				return U[ENV]
-			end
-			local src = info(fn, "s")
-			if src == "[C]" or internal[src] then
-				return hostGetfenv(0)
-			end
-			return hostGetfenv(fn)
-		end
-
-		-- Function at a level argument, with the host's argument errors (raised without a position, as by C).
-		-- @param name string – "getfenv" or "setfenv", for messages
-		-- @param target any – level argument
-		local function Resolve(name: string, target: any): (number, any)
-			local level = tonumber(target)
-			if level == nil then
-				error(`invalid argument #1 to '{name}' (number expected, got {typeof(target)})`, 0)
-			end
-			level = if level >= 0 then math.floor(level) else math.ceil(level)
-			if level < 0 then
-				error(`invalid argument #1 to '{name}' (level must be non-negative)`, 0)
-			elseif level == 0 then
-				return 0, nil
-			end
-			local fn = AtLevel(state.Owners, level)
-			if fn == nil then
-				error(`invalid argument #1 to '{name}' (invalid level)`, 0)
-			end
-			return level, fn
-		end
-
-		-- getfenv for guest code.
-		-- @param target any – level (default 1) or function
-		state.getfenv = function(target: any?): any
-			local env
-			if type(target) == "function" then
-				env = EnvOf(target)
-			else
-				local level, fn = Resolve("getfenv", if target == nil then 1 else target)
-				env = if level == 0 then hostGetfenv(0) else EnvOf(fn)
-			end
-			if type(env) == "table" then
-				state.Unsafe[env] = true
-			end
-			return env
-		end
-
-		-- setfenv for guest code; returns the function whose environment changed, as the host does.
-		state.setfenv = function(target: any, env: any): any
-			if type(env) ~= "table" then
-				error(`invalid argument #2 to 'setfenv' (table expected, got {typeof(env)})`, 0)
-			end
-			local fn = target
-			if type(target) ~= "function" then
-				local level
-				level, fn = Resolve("setfenv", target)
-				if level == 0 then
-					state.Unsafe[env] = true
-					hostSetfenv(0, env)
-					return nil
-				end
-			end
-			state.Unsafe[env] = true
-			local U = state.Owners[fn]
-			if U then
-				U[ENV] = env
-				return fn
-			end
-			local src = info(fn, "s")
-			if src == "[C]" or internal[src] then
-				error("'setfenv' cannot change environment of given object", 0)
-			end
-			return hostSetfenv(fn, env)
-		end
-
-		return state
-	end
-
-	-- Swaps the host getfenv/setfenv for the state's versions when guest code reads them.
-	function Env.Swap(state: EnvState, value: any): any
-		if rawequal(value, hostGetfenv) then
-			return state.getfenv
-		elseif rawequal(value, hostSetfenv) then
-			return state.setfenv
-		end
-		return value
-	end
-
-	Env.MarkInternal(Env.Swap)
-
-	return Env
-end)()
-
--- Classes.luau
-local Module_Classes = (function()
-	-- Luau classes (bytecode versions 10 and 100): class objects, instances and the `class` library, after VM/src/lclass.cpp.
-	-- Why: class bytecode needs a runtime object model; pure Luau cannot create new value types, so classes and
-	-- instances are tables whose shared metatables reproduce the host's member rules and error messages, and the
-	-- builtins that reveal a type (type, typeof, getmetatable) are swapped for class-aware versions in class chunks.
-	--
-	-- A class record mirrors LuauClass: member offsets are 0-based, instance members come first (public fields, then
-	-- private fields), then static members (public methods, then private methods). An instance stores its members by
-	-- offset + 1 in an array held under a private key, so every named access goes through the class's metamethods.
-
-
-	-- Private keys: an instance's member array and a class value's record
-	local STORE, CLASS = newproxy(false), newproxy(false)
-
-	local hostType, hostTypeof, hostGetmetatable = type, typeof, getmetatable
-	local create = table.create
-	local format = string.format
-
-	local lastId = 0
-	local addresses = 0
-
-	local Classes = {}
-
-	-- Fake address for default tostring; real addresses are not observable from Luau.
-	local function Address(kind: string): string
-		addresses += 1
-		return format("%s: 0x%016x", kind, addresses)
-	end
-
-	-- Guest-visible type name, as luaT_objtypename reports it.
-	local function TypeName(value: any): string
-		if hostType(value) == "table" then
-			if rawget(value, STORE) ~= nil then
-				return "object"
-			elseif rawget(value, CLASS) ~= nil then
-				return "class"
-			end
-		end
-		return hostTypeof(value)
-	end
-
-	-- Raises a host runtime error (luaG_runerror). The position names this module, which the Debug option replaces
-	-- with the guest instruction's, as it does for every error raised inside the interpreter.
-	local function Raise(message: string): never
-		error(message, 1)
-	end
-
-	local function MissingMember(object: any, key: any): never
-		if hostType(key) ~= "string" then
-			Raise(`cannot index {TypeName(object)} with a {TypeName(key)}`)
-		end
-		Raise(`this {TypeName(object)} does not have a key named '{key}'`)
-	end
-
-	local function IndexError(object: any, key: any): never
-		if hostType(key) == "string" and #key <= 64 then
-			Raise(`attempt to index {TypeName(object)} with '{key}'`)
-		end
-		Raise(`attempt to index {TypeName(object)} with {TypeName(key)}`)
-	end
-
-	-- Metamethods every instance and class value has unless the class defines its own: they raise the host's
-	-- errors for a value without metamethods, named "object"/"class" instead of "table".
-	local ARITH = { "add", "sub", "mul", "div", "mod", "pow", "idiv" }
-
-	local function Defaults(meta: { [any]: any })
-		for _, op in ARITH do
-			meta["__" .. op] = function(a, b)
-				local ta, tb = TypeName(a), TypeName(b)
-				if ta == tb then
-					Raise(`attempt to perform arithmetic ({op}) on {ta}`)
-				end
-				Raise(`attempt to perform arithmetic ({op}) on {ta} and {tb}`)
-			end
-		end
-		meta.__unm = function(a)
-			Raise(`attempt to perform arithmetic (unm) on {TypeName(a)}`)
-		end
-		meta.__lt = function(a, b)
-			Raise(`attempt to compare {TypeName(a)} < {TypeName(b)}`)
-		end
-		meta.__le = function(a, b)
-			Raise(`attempt to compare {TypeName(a)} <= {TypeName(b)}`)
-		end
-		meta.__concat = function(a, b)
-			Raise(`attempt to concatenate {TypeName(a)} with {TypeName(b)}`)
-		end
-		meta.__len = function(a)
-			Raise(`attempt to get length of a {TypeName(a)} value`)
-		end
-		meta.__call = function(a)
-			Raise(`attempt to call a {TypeName(a)} value`)
-		end
-		meta.__iter = function(a)
-			Raise(`attempt to iterate over a {TypeName(a)} value`)
-		end
-		meta.__metatable = false
-	end
-
-	-- Class value metatable, shared by every class: static members, construction and the host's errors.
-	local ClassMeta: { [any]: any } = {}
-	Defaults(ClassMeta)
-
-	ClassMeta.__index = function(proxy, key)
-		local cls: Class = rawget(proxy, CLASS)
-		local offset = cls.Members[key]
-		if offset == nil or offset < cls.NInstance then
-			MissingMember(proxy, key)
-		end
-		return cls.Statics[offset - cls.NInstance + 1]
-	end
-
-	ClassMeta.__newindex = function(proxy, key)
-		IndexError(proxy, key)
-	end
-
-	ClassMeta.__tostring = function(proxy)
-		local cls: Class = rawget(proxy, CLASS)
-		local text = (cls :: any).Text
-		if not text then
-			text = Address("class")
-			;(cls :: any).Text = text
-		end
-		return text
-	end
-
-	-- luaR_constructobject: the class value's __call. Creates a blank instance and runs __init on it.
-	ClassMeta.__call = function(proxy, ...)
-		local cls: Class = rawget(proxy, CLASS)
-		local self = Classes.Blank(cls)
-		local init = cls.Statics[cls.Members.__init - cls.NInstance + 1]
-		init(self, ...)
-		return self
-	end
-
-	-- Instance metatable of a class: member access by offset; user metamethods are added as they are registered.
-	local function ObjectMeta(cls: Class): { [any]: any }
-		local meta: { [any]: any } = {}
-		Defaults(meta)
-		local members = cls.Members
-		local count = cls.NInstance
-		meta.__index = function(object, key)
-			local offset = members[key]
-			if offset == nil then
-				MissingMember(object, key)
-			elseif offset < count then
-				return rawget(object, STORE)[offset + 1]
-			end
-			return cls.Statics[offset - count + 1]
-		end
-		meta.__newindex = function(object, key, value)
-			local offset = members[key]
-			if offset == nil then
-				MissingMember(object, key)
-			elseif offset >= count then
-				IndexError(object, key)
-			end
-			rawget(object, STORE)[offset + 1] = value
-		end
-		meta.__tostring = function(object)
-			local store = rawget(object, STORE)
-			local text = store.Text
-			if not text then
-				text = Address("object")
-				store.Text = text
-			end
-			return text
-		end
-		return meta
-	end
-
-	-- Makes the guest-visible value for a class record.
-	local function Publish(cls: Class): { [any]: any }
-		local proxy = setmetatable({ [CLASS] = cls }, ClassMeta)
-		cls.Proxy = proxy
-		return proxy
-	end
-
-	local function NewBlankClass(name: string, isOpen: boolean): Class
-		lastId += 1
-		return {
-			Name = name,
-			Id = lastId,
-			IsOpen = isOpen,
-			Super = nil,
-			Members = {},
-			Names = {},
-			NInstance = 0,
-			NMembers = 0,
-			NPrivateFields = 0,
-			OwnPrivateStart = 0,
-			NPrivateStatics = 0,
-			Statics = {},
-			HasUserInit = false,
-			InstanceMeta = nil,
-			ObjectMeta = nil :: any,
-			Proxy = nil :: any,
-		}
-	end
-
-	-- luaR_defaultcreateobject: the __init every class starts with; copies fields from a property table.
-	local function DefaultInit(cls: Class): (...any) -> ()
-		return function(...)
-			if cls.HasUserInit then
-				error(`Class {cls.Name} must define a constructor because it is derived from a class that defines one`, 0)
-			elseif cls.NPrivateFields ~= 0 then
-				if cls.Super then
-					error(`Class {cls.Name} must define a constructor because it or a class it inherits from has private fields`, 0)
-				end
-				error(`Class {cls.Name} must define a constructor because it has private fields`, 0)
-			end
-			local count = select("#", ...)
-			if count ~= 2 then
-				error(`The constructor of {cls.Name} must be called with 2 arguments.  Got {count}`, 0)
-			end
-			local self, props = ...
-			local store = if hostType(self) == "table" then rawget(self, STORE) else nil
-			if store == nil then
-				error(`{cls.Name}.__init must be called with an instance of the class as its first argument`, 0)
-			end
-			local owner: Class = store[0]
-			if owner ~= cls then
-				error(`Cannot call {cls.Name}.__init on an instance of class {owner.Name}`, 0)
-			end
-			local names = cls.Names
-			for offset = 0, cls.NInstance - 1 do
-				local name = names[offset]
-				if name ~= nil then
-					store[offset + 1] = props[name]
-				end
-			end
-		end
-	end
-
-	-- luaR_setupconstructor: installs the default __init in the class's __init slot.
-	local function SetupConstructor(cls: Class)
-		cls.ObjectMeta = cls.ObjectMeta or ObjectMeta(cls)
-		local offset = cls.Members.__init
-		assert(offset ~= nil and offset >= cls.NInstance, "class shape has no __init")
-		cls.Statics[offset - cls.NInstance + 1] = DefaultInit(cls)
-	end
-
-	-- luaR_newclass: a class from its LBC_CONSTANT_CLASS_SHAPE constant, as the loader builds it.
-	-- @param publicFields { string } – public instance field names in offset order
-	-- @param publicMethods { string } – public method names in offset order (after every instance member)
-	-- @param privateFields number – unnamed instance fields after the public ones
-	-- @param privateMethods number – unnamed methods after the public ones
-	function Classes.FromShape(name: string, publicFields: { string }, publicMethods: { string }, privateFields: number, privateMethods: number): any
-		local cls = NewBlankClass(name, false)
-		local nInstance = #publicFields + privateFields
-		local nStatic = #publicMethods + privateMethods
-		for i, field in publicFields do
-			cls.Members[field] = i - 1
-			cls.Names[i - 1] = field
-		end
-		for i, method in publicMethods do
-			cls.Members[method] = nInstance + i - 1
-			cls.Names[nInstance + i - 1] = method
-		end
-		cls.NInstance = nInstance
-		cls.NMembers = nInstance + nStatic
-		cls.NPrivateFields = privateFields
-		cls.OwnPrivateStart = nInstance - privateFields
-		cls.NPrivateStatics = privateMethods
-		cls.Statics = create(nStatic)
-		SetupConstructor(cls)
-		return Publish(cls)
-	end
-
-	-- Class record of a class value, or nil.
-	function Classes.Of(value: any): Class?
-		if hostType(value) == "table" then
-			return rawget(value, CLASS)
-		end
-		return nil
-	end
-
-	-- Member array of an instance, or nil.
-	function Classes.StoreOf(value: any): { any }?
-		if hostType(value) == "table" then
-			return rawget(value, STORE)
-		end
-		return nil
-	end
-
-	-- luaR_newblankobject with members set to nil.
-	function Classes.Blank(cls: Class): any
-		local store = create(cls.NInstance)
-		store[0] = cls
-		return setmetatable({ [STORE] = store }, cls.ObjectMeta)
-	end
-
-	-- Sets the instance metatable entry for a metamethod, keeping the defaults for the rest.
-	local function SetMetamethod(cls: Class, name: string, value: any)
-		local user = cls.InstanceMeta
-		if not user then
-			user = {}
-			cls.InstanceMeta = user
-		end
-		user[name] = value
-		cls.ObjectMeta[name] = value
-	end
-
-	-- Names the host treats as metamethods for classes (the parser's allowlist; __init is a plain static).
-	local METAMETHODS = {
-		__call = true, __concat = true, __unm = true, __add = true, __sub = true, __mul = true, __div = true,
-		__mod = true, __pow = true, __tostring = true, __eq = true, __lt = true, __le = true, __iter = true,
-		__len = true, __idiv = true,
-	}
-
-	-- luaR_addpublicstaticmember (NEWCLASSMEMBER, public).
-	function Classes.AddPublic(proxy: any, name: string, value: any)
-		local cls = rawget(proxy, CLASS) :: Class
-		local offset = cls.Members[name]
-		cls.Statics[offset - cls.NInstance + 1] = value
-		if name == "__init" then
-			cls.HasUserInit = true
-		end
-		if METAMETHODS[name] then
-			local user = cls.InstanceMeta
-			if user and (name == "__eq" or name == "__lt" or name == "__le") and user[name] ~= nil then
-				Raise(`Overriding comparison metamethods is not allowed ('{name}' in class '{cls.Name}')`)
-			end
-			SetMetamethod(cls, name, value)
-		end
-	end
-
-	-- luaR_addprivatestaticmember (NEWCLASSMEMBER, private).
-	function Classes.AddPrivate(proxy: any, index: number, value: any)
-		local cls = rawget(proxy, CLASS) :: Class
-		cls.Statics[cls.NMembers - cls.NInstance - cls.NPrivateStatics + index + 1] = value
-	end
-
-	-- luaR_inheritclass: a flattened class combining parent and child, as NEWCLASS with a superclass makes.
-	function Classes.Inherit(childProxy: any, parentProxy: any): any
-		local child = rawget(childProxy, CLASS) :: Class
-		local parent = rawget(parentProxy, CLASS) :: Class
-		if not parent.IsOpen then
-			Raise(`Non-open class '{parent.Name}' cannot be extended`)
-		end
-		for offset = 0, parent.NInstance - 1 do
-			local name = parent.Names[offset]
-			if name ~= nil and child.Members[name] ~= nil then
-				Raise(`Cannot override instance member '{name}' of parent class '{parent.Name}' in child class '{child.Name}'`)
-			end
-		end
-
-		local cls = NewBlankClass(child.Name, child.IsOpen)
-		cls.Super = parent
-		cls.HasUserInit = parent.HasUserInit
-
-		local offset = 0
-		for i = 0, parent.NInstance - 1 do
-			local name = parent.Names[i]
-			cls.Names[offset] = name
-			if name ~= nil then
-				cls.Members[name] = offset
-			end
-			offset += 1
-		end
-		for i = 0, child.NInstance - 1 do
-			local name = child.Names[i]
-			cls.Names[offset] = name
-			if name ~= nil then
-				cls.Members[name] = offset
-			end
-			offset += 1
-		end
-		cls.NPrivateFields = child.NPrivateFields + parent.NPrivateFields
-		cls.OwnPrivateStart = child.OwnPrivateStart + parent.NInstance
-		cls.NInstance = offset
-
-		-- parent's public statics the child does not redeclare, then the child's public statics, then its private ones
-		local statics = {}
-		local parentPublicEnd = parent.NMembers - parent.NPrivateStatics
-		for i = parent.NInstance, parentPublicEnd - 1 do
-			local name = parent.Names[i]
-			if child.Members[name] == nil then
-				table.insert(statics, name)
-				cls.Statics[#statics] = parent.Statics[i - parent.NInstance + 1]
-			end
-		end
-		local childPublicEnd = child.NMembers - child.NPrivateStatics
-		for i = child.NInstance, childPublicEnd - 1 do
-			local name = child.Names[i]
-			table.insert(statics, name)
-			cls.Statics[#statics] = child.Statics[i - child.NInstance + 1]
-		end
-		for i, name in statics do
-			cls.Names[offset + i - 1] = name
-			cls.Members[name] = offset + i - 1
-		end
-		local publicStatics = #statics
-		local childPrivateBase = child.NMembers - child.NInstance - child.NPrivateStatics
-		for i = 1, child.NPrivateStatics do
-			cls.Statics[publicStatics + i] = child.Statics[childPrivateBase + i]
-		end
-		cls.NPrivateStatics = child.NPrivateStatics
-		cls.NMembers = offset + publicStatics + child.NPrivateStatics
-
-		cls.ObjectMeta = ObjectMeta(cls)
-		if parent.InstanceMeta then
-			for name, value in parent.InstanceMeta do
-				SetMetamethod(cls, name, value)
-			end
-		end
-		SetupConstructor(cls)
-		return Publish(cls)
-	end
-
-	-- Whether an instance's class is cls or derives from it (luaR_isinstance).
-	function Classes.IsInstance(store: { any }, cls: Class): boolean
-		local c: Class? = store[0]
-		while c do
-			if c == cls then
-				return true
-			end
-			c = c.Super
-		end
-		return false
-	end
-
-	-- Whether child is ancestor or derives from it (luaR_issubclass).
-	function Classes.IsSubclass(child: Class, ancestor: Class): boolean
-		local c: Class? = child
-		while c do
-			if c == ancestor then
-				return true
-			end
-			c = c.Super
-		end
-		return false
-	end
-
-	-- Private static member of a class by index.
-	function Classes.PrivateStatic(cls: Class, index: number): any
-		return cls.Statics[cls.NMembers - cls.NInstance - cls.NPrivateStatics + index + 1]
-	end
-
-	Classes.TypeName = TypeName
-
-	-- The `class` library (lclasslib.cpp).
-	local function MissingArgument(n: number, fname: string): never
-		error(`missing argument #{n} to '{fname}'`, 0)
-	end
-
-	Classes.Library = table.freeze({
-		isinstance = function(...)
-			local count = select("#", ...)
-			local object, cls = ...
-			if count < 1 then
-				MissingArgument(1, "isinstance")
-			end
-			local record = Classes.Of(cls)
-			if record == nil then
-				if count < 2 then
-					MissingArgument(2, "isinstance")
-				end
-				error(`invalid argument #2 to 'isinstance' (class expected, got {TypeName(cls)})`, 0)
-			end
-			local store = Classes.StoreOf(object)
-			return store ~= nil and Classes.IsInstance(store, record :: Class)
-		end,
-		classof = function(...)
-			if select("#", ...) < 1 then
-				MissingArgument(1, "classof")
-			end
-			local store = Classes.StoreOf((...))
-			if store == nil then
-				return nil
-			end
-			return (store[0] :: Class).Proxy
-		end,
-	})
-
-	-- Class-aware builtins, swapped in for the host's when class bytecode reads them.
-	Classes.Builtins = {
-		type = function(...)
-			local value = ...
-			if select("#", ...) > 0 and hostType(value) == "table" then
-				local name = TypeName(value)
-				if name ~= "table" then
-					return name
-				end
-			end
-			return hostType(...)
-		end,
-		typeof = function(...)
-			local value = ...
-			if select("#", ...) > 0 and hostType(value) == "table" then
-				return TypeName(value)
-			end
-			return hostTypeof(...)
-		end,
-		getmetatable = function(...)
-			local value = ...
-			if hostType(value) == "table" and (rawget(value, STORE) ~= nil or rawget(value, CLASS) ~= nil) then
-				return nil
-			end
-			return hostGetmetatable(...)
-		end,
-	}
-
-	-- Host builtin -> class-aware replacement.
-	Classes.Swaps = {
-		[hostType] = Classes.Builtins.type,
-		[hostTypeof] = Classes.Builtins.typeof,
-		[hostGetmetatable] = Classes.Builtins.getmetatable,
-	} :: { [any]: any }
-
-	return Classes
-end)()
-
--- Deserializer.luau
-local Module_Deserializer = (function()
-	-- Parses serialized Luau bytecode into plain proto records.
-	-- Pure data transform: no execution and no environment access, so it is safe on untrusted input.
-
-	local Runtime = Module_Runtime
-	local Classes = Module_Classes
-
-	local PresizedHash = Runtime.PresizedHash
-
-
-	local readu8 = buffer.readu8
-	local readu32 = buffer.readu32
-	local readf32 = buffer.readf32
-	local readf64 = buffer.readf64
-	local readstring = buffer.readstring
-
-	-- Constant kinds (LuauBytecodeConstantType)
-	local K_NIL, K_BOOLEAN, K_NUMBER, K_STRING, K_IMPORT, K_TABLE, K_CLOSURE, K_VECTOR = 0, 1, 2, 3, 4, 5, 6, 7
-	local K_TABLE_CONSTANTS, K_INTEGER, K_CLASS_SHAPE, K_VECTORD = 8, 9, 10, 11
-
-	-- Builds a 64-bit integer constant from its 7-bit varint groups.
-	-- Exists because integer values can only be made through the host integer library; wrapping arithmetic
-	-- reproduces the two's complement bit pattern of the magnitude.
-	-- @param groups { number } – 7-bit groups, least significant first
-	-- @param negative boolean – sign flag stored next to the magnitude
-	local function MakeInteger(groups: { number }, negative: boolean): any
-		local lib = (_G :: any).integer
-		assert(lib, "64-bit integer constants require the integer library")
-		local radix = lib.create(128)
-		local value = lib.create(0)
-		for i = #groups, 1, -1 do
-			value = lib.add(lib.mul(value, radix), lib.create(groups[i]))
-		end
-		return if negative then lib.neg(value) else value
-	end
-
-	-- Deserializes a bytecode blob into protos.
-	-- @param input string | buffer – bytecode as produced by luau-compile or luau_compile
-	-- @param vectorCtor (number, number, number, number) -> any – builds vector constants
-	local function Deserialize(input: string | buffer, vectorCtor: (number, number, number, number) -> any): Chunk
-		local stream = if type(input) == "string" then buffer.fromstring(input) else input :: buffer
-		local size = buffer.len(stream)
-		local cursor = 0
-
-		local function u8(): number
-			local v = readu8(stream, cursor)
-			cursor += 1
-			return v
-		end
-
-		local function u32(): number
-			local v = readu32(stream, cursor)
-			cursor += 4
-			return v
-		end
-
-		local function f64(): number
-			local v = readf64(stream, cursor)
-			cursor += 8
-			return v
-		end
-
-		local function f32(): number
-			local v = readf32(stream, cursor)
-			cursor += 4
-			return v
-		end
-
-		local function varint(): number
-			local result, scale = 0, 1
-			repeat
-				local b = u8()
-				result += (b % 128) * scale
-				scale *= 128
-			until b < 128
-			return result
-		end
-
-		local version = u8()
-		if version == 0 then
-			error(readstring(stream, 1, size - 1), 0)
-		elseif (version < 3 or version > 14) and version ~= 100 then
-			error(`unsupported bytecode version {version}`, 0)
-		end
-		local typesVersion = if version >= 4 then u8() else 0
-
-		local strings: { string } = {}
-		for i = 1, varint() do
-			local len = varint()
-			strings[i] = readstring(stream, cursor, len)
-			cursor += len
-		end
-
-		-- userdata type names only feed the host's type remapping
-		if typesVersion == 3 then
-			while u8() ~= 0 do
-				varint()
-			end
-		end
-
-		local hasClasses = false
-
-		local protoCount = varint()
-		local protos: { Proto } = table.create(protoCount)
-
-		for index = 1, protoCount do
-			local protoSize = if version >= 12 then varint() else 0
-			local protoStart = cursor
-
-			local maxStack, params, upvalues = u8(), u8(), u8()
-			local isVararg = u8() ~= 0
-			local flags = 0
-			if version >= 4 then
-				flags = u8()
-				cursor += varint() -- type info
-			end
-
-			local codeSize = varint()
-			local code = table.create(codeSize)
-			for i = 1, codeSize do
-				code[i] = u32()
-			end
-
-			local constCount = varint()
-			local constants: { any } = table.create(constCount)
-			local imports: { [number]: number } = {}
-			local closures: { [number]: number } = {}
-			local templates: { [number]: { number } } = {}
-
-			for k = 1, constCount do
-				local kind = u8()
-				if kind == K_NIL then
-					-- stays nil
-				elseif kind == K_BOOLEAN then
-					constants[k] = u8() ~= 0
-				elseif kind == K_NUMBER then
-					constants[k] = f64()
-				elseif kind == K_STRING then
-					constants[k] = strings[varint()]
-				elseif kind == K_IMPORT then
-					imports[k] = u32()
-				elseif kind == K_TABLE or kind == K_TABLE_CONSTANTS then
-					local fields = {}
-					for i = 1, varint() do
-						fields[i * 2 - 1] = varint()
-						if kind == K_TABLE then
-							fields[i * 2] = -1
-						else
-							local ki = u32()
-							fields[i * 2] = if ki >= 0x80000000 then ki - 0x100000000 else ki
-						end
-					end
-					templates[k] = fields
-				elseif kind == K_CLOSURE then
-					closures[k] = varint() + 1
-				elseif kind == K_VECTOR then
-					local x, y, z, w = f32(), f32(), f32(), f32()
-					constants[k] = vectorCtor(x, y, z, w)
-				elseif kind == K_VECTORD then
-					local x, y, z, w = f64(), f64(), f64(), f64()
-					constants[k] = vectorCtor(x, y, z, w)
-				elseif kind == K_INTEGER then
-					local negative = u8() ~= 0
-					local groups = {}
-					repeat
-						local b = u8()
-						table.insert(groups, b % 128)
-					until b < 128
-					constants[k] = MakeInteger(groups, negative)
-				elseif kind == K_CLASS_SHAPE then
-					-- the class is created once per load, as the host loader does; NEWCLASS hands out this value
-					local name = constants[varint() + 1]
-					local privateFields, privateMethods = u8(), u8()
-					local properties, methods = varint(), varint()
-					local fields, names = {}, {}
-					for i = 1, properties - privateFields do
-						fields[i] = constants[varint() + 1]
-					end
-					for i = 1, methods - privateMethods do
-						names[i] = constants[varint() + 1]
-					end
-					constants[k] = Classes.FromShape(name, fields, names, privateFields, privateMethods)
-					hasClasses = true
-				else
-					error(`unknown constant kind {kind}`, 0)
-				end
-			end
-
-			-- templates reference other constants by index, so they are built once every constant is known
-			for k, fields in templates do
-				local template = PresizedHash(#fields // 2)
-				local nilKeys = {}
-				for i = 1, #fields, 2 do
-					local key = constants[fields[i] + 1]
-					local vi = fields[i + 1]
-					local value = if vi >= 0 then constants[vi + 1] else nil
-					-- placeholder 0 mirrors the host loader: every field gets its node in order, nil constants last
-					template[key] = if value == nil then 0 else value
-					if vi >= 0 and value == nil then
-						table.insert(nilKeys, key)
-					end
-				end
-				for _, key in nilKeys do
-					template[key] = nil
-				end
-				constants[k] = template
-			end
-
-			local children = {}
-			for i = 1, varint() do
-				children[i] = varint() + 1
-			end
-
-			varint() -- line defined
-			local debugName = strings[varint()]
-
-			-- line info: per-instruction byte deltas on top of absolute lines sampled every 2^gapLog2 instructions
-			local lines: { number }? = nil
-			if u8() ~= 0 then
-				local gapLog2 = u8()
-				local intervals = (codeSize - 1) // 2 ^ gapLog2 + 1
-				local offsets = table.create(codeSize)
-				local last = 0
-				for i = 1, codeSize do
-					last = (last + u8()) % 256
-					offsets[i] = last
-				end
-				local absolute = table.create(intervals)
-				local line = 0
-				for i = 1, intervals do
-					line += buffer.readi32(stream, cursor)
-					cursor += 4
-					absolute[i] = line
-				end
-				lines = offsets
-				for i = 1, codeSize do
-					offsets[i] = absolute[(i - 1) // 2 ^ gapLog2 + 1] + offsets[i]
-				end
-			end
-
-			if u8() ~= 0 then -- debug info
-				for _ = 1, varint() do
-					varint()
-					varint()
-					varint()
-					u8()
-				end
-				for _ = 1, varint() do
-					varint()
-				end
-			end
-
-			-- feedback slots: call targets (unused here) and CONSTRUCT shapes (constant index of the table template)
-			local shapes: { [number]: number } = {}
-			if version >= 11 then
-				for slot = 0, varint() - 1 do
-					local kind = u8()
-					local value = varint()
-					if kind == 1 then
-						shapes[slot] = value + 1
-					end
-				end
-			end
-
-			if version >= 12 then
-				cursor = protoStart + protoSize
-			end
-
-			protos[index] = {
-				MaxStack = maxStack,
-				Params = params,
-				Upvalues = upvalues,
-				IsVararg = isVararg,
-				Flags = flags,
-				Code = code,
-				Constants = constants,
-				Imports = imports,
-				Closures = closures,
-				Children = children,
-				Name = debugName,
-				Lines = lines,
-				Shapes = shapes,
-			}
-		end
-
-		local main = varint() + 1
-		if cursor ~= size then
-			error("malformed bytecode: trailing data", 0)
-		end
-
-		return { Protos = protos, Main = main, HasClasses = hasClasses }
-	end
-
-	return Deserialize
 end)()
 
 -- Analysis.luau
@@ -2480,304 +1480,707 @@ local Module_Analysis = (function()
 	return Analysis
 end)()
 
--- Ops/Values.luau
-local Module_Values = (function()
-	-- Handlers that move values: constants, registers, globals, upvalues and varargs.
-	-- Each maker returns a chained handler (calls its successor) or a returning one (hands the successor back to a trampoline).
-	-- @param Next Handler – successor, or a loop token in returning mode
-	-- @param Chain boolean – whether to call Next directly
+-- Classes.luau
+local Module_Classes = (function()
+	-- Luau classes (bytecode versions 10 and 100): class objects, instances and the `class` library, after VM/src/lclass.cpp.
+	-- Why: class bytecode needs a runtime object model; pure Luau cannot create new value types, so classes and
+	-- instances are tables whose shared metatables reproduce the host's member rules and error messages, and the
+	-- builtins that reveal a type (type, typeof, getmetatable) are swapped for class-aware versions in class chunks.
+	--
+	-- A class record mirrors LuauClass: member offsets are 0-based, instance members come first (public fields, then
+	-- private fields), then static members (public methods, then private methods). An instance stores its members by
+	-- offset + 1 in an array held under a private key, so every named access goes through the class's metamethods.
 
-	local Runtime = Module_Runtime
 
+	-- Private keys: an instance's member array and a class value's record
+	local STORE, CLASS = newproxy(false), newproxy(false)
 
-	local move = table.move
-	local TOP = Runtime.TOP
+	local hostType, hostTypeof, hostGetmetatable = type, typeof, getmetatable
+	local create = table.create
+	local format = string.format
 
-	local Values = {}
+	local lastId = 0
+	local addresses = 0
 
-	-- LOADNIL/LOADB/LOADN/LOADK/LOADKX and pre-resolved GETIMPORT: stores a value known at load time.
-	-- @param A number – target frame index
-	-- @param K any – value to store
-	function Values.LoadK(A: number, K: any, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[A] = K
-				return Next(S)
+	local Classes = {}
+
+	-- Fake address for default tostring; real addresses are not observable from Luau.
+	local function Address(kind: string): string
+		addresses += 1
+		return format("%s: 0x%016x", kind, addresses)
+	end
+
+	-- Guest-visible type name, as luaT_objtypename reports it.
+	local function TypeName(value: any): string
+		if hostType(value) == "table" then
+			if rawget(value, STORE) ~= nil then
+				return "object"
+			elseif rawget(value, CLASS) ~= nil then
+				return "class"
 			end
 		end
-		return function(S)
-			S[A] = K
-			return Next
-		end
+		return hostTypeof(value)
 	end
 
-	-- MOVE: copies a register.
-	-- @param A number – target frame index
-	-- @param B number – source frame index
-	function Values.Move(A: number, B: number, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[A] = S[B]
-				return Next(S)
+	-- Raises a host runtime error (luaG_runerror). The position names this module, which the Debug option replaces
+	-- with the guest instruction's, as it does for every error raised inside the interpreter.
+	local function Raise(message: string): never
+		error(message, 1)
+	end
+
+	local function MissingMember(object: any, key: any): never
+		if hostType(key) ~= "string" then
+			Raise(`cannot index {TypeName(object)} with a {TypeName(key)}`)
+		end
+		Raise(`this {TypeName(object)} does not have a key named '{key}'`)
+	end
+
+	local function IndexError(object: any, key: any): never
+		if hostType(key) == "string" and #key <= 64 then
+			Raise(`attempt to index {TypeName(object)} with '{key}'`)
+		end
+		Raise(`attempt to index {TypeName(object)} with {TypeName(key)}`)
+	end
+
+	-- Metamethods every instance and class value has unless the class defines its own: they raise the host's
+	-- errors for a value without metamethods, named "object"/"class" instead of "table".
+	local ARITH = { "add", "sub", "mul", "div", "mod", "pow", "idiv" }
+
+	local function Defaults(meta: { [any]: any })
+		for _, op in ARITH do
+			meta["__" .. op] = function(a, b)
+				local ta, tb = TypeName(a), TypeName(b)
+				if ta == tb then
+					Raise(`attempt to perform arithmetic ({op}) on {ta}`)
+				end
+				Raise(`attempt to perform arithmetic ({op}) on {ta} and {tb}`)
 			end
 		end
-		return function(S)
-			S[A] = S[B]
-			return Next
+		meta.__unm = function(a)
+			Raise(`attempt to perform arithmetic (unm) on {TypeName(a)}`)
 		end
+		meta.__lt = function(a, b)
+			Raise(`attempt to compare {TypeName(a)} < {TypeName(b)}`)
+		end
+		meta.__le = function(a, b)
+			Raise(`attempt to compare {TypeName(a)} <= {TypeName(b)}`)
+		end
+		meta.__concat = function(a, b)
+			Raise(`attempt to concatenate {TypeName(a)} with {TypeName(b)}`)
+		end
+		meta.__len = function(a)
+			Raise(`attempt to get length of a {TypeName(a)} value`)
+		end
+		meta.__call = function(a)
+			Raise(`attempt to call a {TypeName(a)} value`)
+		end
+		meta.__iter = function(a)
+			Raise(`attempt to iterate over a {TypeName(a)} value`)
+		end
+		meta.__metatable = false
 	end
 
-	-- GETGLOBAL: reads a global from the chunk environment.
-	-- @param Env table – chunk environment
-	-- @param K string – global name
-	function Values.GetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[A] = Env[K]
-				return Next(S)
+	-- Class value metatable, shared by every class: static members, construction and the host's errors.
+	local ClassMeta: { [any]: any } = {}
+	Defaults(ClassMeta)
+
+	ClassMeta.__index = function(proxy, key)
+		local cls: Class = rawget(proxy, CLASS)
+		local offset = cls.Members[key]
+		if offset == nil or offset < cls.NInstance then
+			MissingMember(proxy, key)
+		end
+		return cls.Statics[offset - cls.NInstance + 1]
+	end
+
+	ClassMeta.__newindex = function(proxy, key)
+		IndexError(proxy, key)
+	end
+
+	ClassMeta.__tostring = function(proxy)
+		local cls: Class = rawget(proxy, CLASS)
+		local text = (cls :: any).Text
+		if not text then
+			text = Address("class")
+			;(cls :: any).Text = text
+		end
+		return text
+	end
+
+	-- luaR_constructobject: the class value's __call. Creates a blank instance and runs __init on it.
+	ClassMeta.__call = function(proxy, ...)
+		local cls: Class = rawget(proxy, CLASS)
+		local self = Classes.Blank(cls)
+		local init = cls.Statics[cls.Members.__init - cls.NInstance + 1]
+		init(self, ...)
+		return self
+	end
+
+	-- Instance metatable of a class: member access by offset; user metamethods are added as they are registered.
+	local function ObjectMeta(cls: Class): { [any]: any }
+		local meta: { [any]: any } = {}
+		Defaults(meta)
+		local members = cls.Members
+		local count = cls.NInstance
+		meta.__index = function(object, key)
+			local offset = members[key]
+			if offset == nil then
+				MissingMember(object, key)
+			elseif offset < count then
+				return rawget(object, STORE)[offset + 1]
 			end
+			return cls.Statics[offset - count + 1]
 		end
-		return function(S)
-			S[A] = Env[K]
-			return Next
-		end
-	end
-
-	-- GETGLOBAL of error/assert feeding a call: substitutes the call site's positioned wrapper for the real function.
-	-- @param Swaps { [any]: any } – real function -> wrapper
-	function Values.GetGlobalSwapped(A: number, Env: any, K: string, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
-		return function(S)
-			local v = Env[K]
-			S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	-- SETGLOBAL: writes a global into the chunk environment.
-	function Values.SetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				Env[K] = S[A]
-				return Next(S)
+		meta.__newindex = function(object, key, value)
+			local offset = members[key]
+			if offset == nil then
+				MissingMember(object, key)
+			elseif offset >= count then
+				IndexError(object, key)
 			end
+			rawget(object, STORE)[offset + 1] = value
 		end
-		return function(S)
-			Env[K] = S[A]
-			return Next
+		meta.__tostring = function(object)
+			local store = rawget(object, STORE)
+			local text = store.Text
+			if not text then
+				text = Address("object")
+				store.Text = text
+			end
+			return text
 		end
+		return meta
 	end
 
-	-- GETIMPORT that could not be resolved at load: walks the path on every execution.
-	-- Indexing a missing step raises, as the host's run-time import fallback does.
-	-- @param Path { string } – one to three keys
-	function Values.GetImport(A: number, Env: any, Path: { string }, Next: Handler, Chain: boolean): Handler
-		local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
-		local function Resolve(): any
-			local v = Env[k1]
-			if count > 1 then
-				v = v[k2]
-				if count > 2 then
-					v = v[k3]
+	-- Makes the guest-visible value for a class record.
+	local function Publish(cls: Class): { [any]: any }
+		local proxy = setmetatable({ [CLASS] = cls }, ClassMeta)
+		cls.Proxy = proxy
+		return proxy
+	end
+
+	local function NewBlankClass(name: string, isOpen: boolean): Class
+		lastId += 1
+		return {
+			Name = name,
+			Id = lastId,
+			IsOpen = isOpen,
+			Super = nil,
+			Members = {},
+			Names = {},
+			NInstance = 0,
+			NMembers = 0,
+			NPrivateFields = 0,
+			OwnPrivateStart = 0,
+			NPrivateStatics = 0,
+			Statics = {},
+			HasUserInit = false,
+			InstanceMeta = nil,
+			ObjectMeta = nil :: any,
+			Proxy = nil :: any,
+		}
+	end
+
+	-- luaR_defaultcreateobject: the __init every class starts with; copies fields from a property table.
+	local function DefaultInit(cls: Class): (...any) -> ()
+		return function(...)
+			if cls.HasUserInit then
+				error(`Class {cls.Name} must define a constructor because it is derived from a class that defines one`, 0)
+			elseif cls.NPrivateFields ~= 0 then
+				if cls.Super then
+					error(`Class {cls.Name} must define a constructor because it or a class it inherits from has private fields`, 0)
+				end
+				error(`Class {cls.Name} must define a constructor because it has private fields`, 0)
+			end
+			local count = select("#", ...)
+			if count ~= 2 then
+				error(`The constructor of {cls.Name} must be called with 2 arguments.  Got {count}`, 0)
+			end
+			local self, props = ...
+			local store = if hostType(self) == "table" then rawget(self, STORE) else nil
+			if store == nil then
+				error(`{cls.Name}.__init must be called with an instance of the class as its first argument`, 0)
+			end
+			local owner: Class = store[0]
+			if owner ~= cls then
+				error(`Cannot call {cls.Name}.__init on an instance of class {owner.Name}`, 0)
+			end
+			local names = cls.Names
+			for offset = 0, cls.NInstance - 1 do
+				local name = names[offset]
+				if name ~= nil then
+					store[offset + 1] = props[name]
 				end
 			end
-			return v
-		end
-		if Chain then
-			return function(S)
-				S[A] = Resolve()
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[A] = Resolve()
-			return Next
 		end
 	end
 
-	-- GETIMPORT walked per access, with values replaced when read (class-aware builtins).
-	-- @param Swaps { [any]: any } – host value -> replacement
-	function Values.GetImportSwapped(A: number, Env: any, Path: { string }, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
-		local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
-		return function(S)
-			local v = Env[k1]
-			if count > 1 then
-				v = v[k2]
-				if count > 2 then
-					v = v[k3]
+	-- luaR_setupconstructor: installs the default __init in the class's __init slot.
+	local function SetupConstructor(cls: Class)
+		cls.ObjectMeta = cls.ObjectMeta or ObjectMeta(cls)
+		local offset = cls.Members.__init
+		assert(offset ~= nil and offset >= cls.NInstance, "class shape has no __init")
+		cls.Statics[offset - cls.NInstance + 1] = DefaultInit(cls)
+	end
+
+	-- luaR_newclass: a class from its LBC_CONSTANT_CLASS_SHAPE constant, as the loader builds it.
+	-- @param publicFields { string } – public instance field names in offset order
+	-- @param publicMethods { string } – public method names in offset order (after every instance member)
+	-- @param privateFields number – unnamed instance fields after the public ones
+	-- @param privateMethods number – unnamed methods after the public ones
+	function Classes.FromShape(name: string, publicFields: { string }, publicMethods: { string }, privateFields: number, privateMethods: number): any
+		local cls = NewBlankClass(name, false)
+		local nInstance = #publicFields + privateFields
+		local nStatic = #publicMethods + privateMethods
+		for i, field in publicFields do
+			cls.Members[field] = i - 1
+			cls.Names[i - 1] = field
+		end
+		for i, method in publicMethods do
+			cls.Members[method] = nInstance + i - 1
+			cls.Names[nInstance + i - 1] = method
+		end
+		cls.NInstance = nInstance
+		cls.NMembers = nInstance + nStatic
+		cls.NPrivateFields = privateFields
+		cls.OwnPrivateStart = nInstance - privateFields
+		cls.NPrivateStatics = privateMethods
+		cls.Statics = create(nStatic)
+		SetupConstructor(cls)
+		return Publish(cls)
+	end
+
+	-- Class record of a class value, or nil.
+	function Classes.Of(value: any): Class?
+		if hostType(value) == "table" then
+			return rawget(value, CLASS)
+		end
+		return nil
+	end
+
+	-- Member array of an instance, or nil.
+	function Classes.StoreOf(value: any): { any }?
+		if hostType(value) == "table" then
+			return rawget(value, STORE)
+		end
+		return nil
+	end
+
+	-- luaR_newblankobject with members set to nil.
+	function Classes.Blank(cls: Class): any
+		local store = create(cls.NInstance)
+		store[0] = cls
+		return setmetatable({ [STORE] = store }, cls.ObjectMeta)
+	end
+
+	-- Sets the instance metatable entry for a metamethod, keeping the defaults for the rest.
+	local function SetMetamethod(cls: Class, name: string, value: any)
+		local user = cls.InstanceMeta
+		if not user then
+			user = {}
+			cls.InstanceMeta = user
+		end
+		user[name] = value
+		cls.ObjectMeta[name] = value
+	end
+
+	-- Names the host treats as metamethods for classes (the parser's allowlist; __init is a plain static).
+	local METAMETHODS = {
+		__call = true, __concat = true, __unm = true, __add = true, __sub = true, __mul = true, __div = true,
+		__mod = true, __pow = true, __tostring = true, __eq = true, __lt = true, __le = true, __iter = true,
+		__len = true, __idiv = true,
+	}
+
+	-- luaR_addpublicstaticmember (NEWCLASSMEMBER, public).
+	function Classes.AddPublic(proxy: any, name: string, value: any)
+		local cls = rawget(proxy, CLASS) :: Class
+		local offset = cls.Members[name]
+		cls.Statics[offset - cls.NInstance + 1] = value
+		if name == "__init" then
+			cls.HasUserInit = true
+		end
+		if METAMETHODS[name] then
+			local user = cls.InstanceMeta
+			if user and (name == "__eq" or name == "__lt" or name == "__le") and user[name] ~= nil then
+				Raise(`Overriding comparison metamethods is not allowed ('{name}' in class '{cls.Name}')`)
+			end
+			SetMetamethod(cls, name, value)
+		end
+	end
+
+	-- luaR_addprivatestaticmember (NEWCLASSMEMBER, private).
+	function Classes.AddPrivate(proxy: any, index: number, value: any)
+		local cls = rawget(proxy, CLASS) :: Class
+		cls.Statics[cls.NMembers - cls.NInstance - cls.NPrivateStatics + index + 1] = value
+	end
+
+	-- luaR_inheritclass: a flattened class combining parent and child, as NEWCLASS with a superclass makes.
+	function Classes.Inherit(childProxy: any, parentProxy: any): any
+		local child = rawget(childProxy, CLASS) :: Class
+		local parent = rawget(parentProxy, CLASS) :: Class
+		if not parent.IsOpen then
+			Raise(`Non-open class '{parent.Name}' cannot be extended`)
+		end
+		for offset = 0, parent.NInstance - 1 do
+			local name = parent.Names[offset]
+			if name ~= nil and child.Members[name] ~= nil then
+				Raise(`Cannot override instance member '{name}' of parent class '{parent.Name}' in child class '{child.Name}'`)
+			end
+		end
+
+		local cls = NewBlankClass(child.Name, child.IsOpen)
+		cls.Super = parent
+		cls.HasUserInit = parent.HasUserInit
+
+		local offset = 0
+		for i = 0, parent.NInstance - 1 do
+			local name = parent.Names[i]
+			cls.Names[offset] = name
+			if name ~= nil then
+				cls.Members[name] = offset
+			end
+			offset += 1
+		end
+		for i = 0, child.NInstance - 1 do
+			local name = child.Names[i]
+			cls.Names[offset] = name
+			if name ~= nil then
+				cls.Members[name] = offset
+			end
+			offset += 1
+		end
+		cls.NPrivateFields = child.NPrivateFields + parent.NPrivateFields
+		cls.OwnPrivateStart = child.OwnPrivateStart + parent.NInstance
+		cls.NInstance = offset
+
+		-- parent's public statics the child does not redeclare, then the child's public statics, then its private ones
+		local statics = {}
+		local parentPublicEnd = parent.NMembers - parent.NPrivateStatics
+		for i = parent.NInstance, parentPublicEnd - 1 do
+			local name = parent.Names[i]
+			if child.Members[name] == nil then
+				table.insert(statics, name)
+				cls.Statics[#statics] = parent.Statics[i - parent.NInstance + 1]
+			end
+		end
+		local childPublicEnd = child.NMembers - child.NPrivateStatics
+		for i = child.NInstance, childPublicEnd - 1 do
+			local name = child.Names[i]
+			table.insert(statics, name)
+			cls.Statics[#statics] = child.Statics[i - child.NInstance + 1]
+		end
+		for i, name in statics do
+			cls.Names[offset + i - 1] = name
+			cls.Members[name] = offset + i - 1
+		end
+		local publicStatics = #statics
+		local childPrivateBase = child.NMembers - child.NInstance - child.NPrivateStatics
+		for i = 1, child.NPrivateStatics do
+			cls.Statics[publicStatics + i] = child.Statics[childPrivateBase + i]
+		end
+		cls.NPrivateStatics = child.NPrivateStatics
+		cls.NMembers = offset + publicStatics + child.NPrivateStatics
+
+		cls.ObjectMeta = ObjectMeta(cls)
+		if parent.InstanceMeta then
+			for name, value in parent.InstanceMeta do
+				SetMetamethod(cls, name, value)
+			end
+		end
+		SetupConstructor(cls)
+		return Publish(cls)
+	end
+
+	-- Whether an instance's class is cls or derives from it (luaR_isinstance).
+	function Classes.IsInstance(store: { any }, cls: Class): boolean
+		local c: Class? = store[0]
+		while c do
+			if c == cls then
+				return true
+			end
+			c = c.Super
+		end
+		return false
+	end
+
+	-- Whether child is ancestor or derives from it (luaR_issubclass).
+	function Classes.IsSubclass(child: Class, ancestor: Class): boolean
+		local c: Class? = child
+		while c do
+			if c == ancestor then
+				return true
+			end
+			c = c.Super
+		end
+		return false
+	end
+
+	-- Private static member of a class by index.
+	function Classes.PrivateStatic(cls: Class, index: number): any
+		return cls.Statics[cls.NMembers - cls.NInstance - cls.NPrivateStatics + index + 1]
+	end
+
+	Classes.TypeName = TypeName
+
+	-- The `class` library (lclasslib.cpp).
+	local function MissingArgument(n: number, fname: string): never
+		error(`missing argument #{n} to '{fname}'`, 0)
+	end
+
+	Classes.Library = table.freeze({
+		isinstance = function(...)
+			local count = select("#", ...)
+			local object, cls = ...
+			if count < 1 then
+				MissingArgument(1, "isinstance")
+			end
+			local record = Classes.Of(cls)
+			if record == nil then
+				if count < 2 then
+					MissingArgument(2, "isinstance")
+				end
+				error(`invalid argument #2 to 'isinstance' (class expected, got {TypeName(cls)})`, 0)
+			end
+			local store = Classes.StoreOf(object)
+			return store ~= nil and Classes.IsInstance(store, record :: Class)
+		end,
+		classof = function(...)
+			if select("#", ...) < 1 then
+				MissingArgument(1, "classof")
+			end
+			local store = Classes.StoreOf((...))
+			if store == nil then
+				return nil
+			end
+			return (store[0] :: Class).Proxy
+		end,
+	})
+
+	-- Class-aware builtins, swapped in for the host's when class bytecode reads them.
+	Classes.Builtins = {
+		type = function(...)
+			local value = ...
+			if select("#", ...) > 0 and hostType(value) == "table" then
+				local name = TypeName(value)
+				if name ~= "table" then
+					return name
 				end
 			end
-			if v ~= nil and Swaps[v] ~= nil then
-				v = Swaps[v]
+			return hostType(...)
+		end,
+		typeof = function(...)
+			local value = ...
+			if select("#", ...) > 0 and hostType(value) == "table" then
+				return TypeName(value)
 			end
-			S[A] = v
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	-- DynamicEnv GETGLOBAL: reads the running closure's environment.
-	-- @param ENV string – upvalue-table key of the environment
-	-- @param Swaps { [any]: any }? – values replaced when read (host getfenv/setfenv, positioned error/assert)
-	function Values.GetGlobalDyn(A: number, ENV: string, K: string, Swaps: { [any]: any }?, Next: Handler, Chain: boolean): Handler
-		if Swaps then
-			return function(S)
-				local v = S[1][ENV][K]
-				S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
-				return if Chain then Next(S) else Next
+			return hostTypeof(...)
+		end,
+		getmetatable = function(...)
+			local value = ...
+			if hostType(value) == "table" and (rawget(value, STORE) ~= nil or rawget(value, CLASS) ~= nil) then
+				return nil
 			end
+			return hostGetmetatable(...)
+		end,
+	}
+
+	-- Host builtin -> class-aware replacement.
+	Classes.Swaps = {
+		[hostType] = Classes.Builtins.type,
+		[hostTypeof] = Classes.Builtins.typeof,
+		[hostGetmetatable] = Classes.Builtins.getmetatable,
+	} :: { [any]: any }
+
+	return Classes
+end)()
+
+-- Env.luau
+local Module_Env = (function()
+	-- Dynamic environments: getfenv/setfenv with the host's semantics, enabled by the DynamicEnv load option.
+	-- Why: by default globals bind to one environment at load time, which is fastest; code that swaps environments
+	-- needs every closure to carry its own environment and imports to re-resolve once an environment is exposed.
+	--
+	-- Each VM closure's upvalue table holds its environment under ENV and the closure itself under FN. Numeric levels
+	-- walk the host call stack: VM closures are real host functions there, interpreter internals are skipped, and
+	-- other functions (pcall, host callbacks) count as levels, as they do on the host.
+
+
+	local hostGetfenv = getfenv
+	local hostSetfenv = setfenv
+	local info = debug.info
+
+	-- Upvalue-table keys of a closure's environment and of the closure itself
+	local ENV, FN = "\0env", "\0fn"
+
+	-- Sources of interpreter modules; their frames are invisible to guest levels
+	local internal: { [string]: boolean } = {}
+	-- Interpreter functions run through a host pcall; that pcall's frame is invisible too
+	local guarded: { [any]: boolean } = {}
+
+	local Env = {}
+
+	Env.ENV = ENV
+	Env.FN = FN
+	Env.HostGetfenv = hostGetfenv
+	Env.HostSetfenv = hostSetfenv
+
+	-- Marks the module defining a function as interpreter-internal.
+	-- @param fn function – any function defined in that module
+	function Env.MarkInternal(fn: (...any) -> ...any)
+		internal[info(fn, "s")] = true
+	end
+
+	-- Marks an interpreter function the interpreter itself calls through pcall (Debug mode).
+	-- @param fn function – function passed to pcall
+	function Env.MarkGuarded(fn: (...any) -> ...any)
+		guarded[fn] = true
+	end
+
+	-- Replaces the position an interpreter module put on an error message with the guest's.
+	-- Why: Debug mode reports host-raised errors (calling nil, arithmetic on nil) at the guest line, as the host VM does.
+	-- @param message any – caught error value; non-strings and guest-positioned messages pass through
+	-- @param where string – guest "chunk:line: " prefix, or "" to drop the internal one
+	function Env.Reposition(message: any, where: string): any
+		if type(message) ~= "string" then
+			return message
 		end
-		return function(S)
-			S[A] = S[1][ENV][K]
-			return if Chain then Next(S) else Next
+		local src, rest = string.match(message, "^(.-):%d+: (.*)$")
+		if src and internal[src] then
+			return where .. rest
+		end
+		return message
+	end
+
+	-- Function at a guest-visible stack level (1 = the function calling getfenv/setfenv); nil past the stack.
+	-- @param owners { [any]: any } – VM closures (defined in an internal module, yet guest-visible)
+	local function AtLevel(owners: { [any]: any }, level: number): any
+		local seen = 0
+		local i = 2 -- 1 is AtLevel's caller in this module
+		local skip = false
+		while true do
+			local fn = info(i, "f")
+			if fn == nil then
+				return nil
+			end
+			if skip then
+				skip = false
+			elseif guarded[fn] then
+				skip = true
+			elseif owners[fn] ~= nil or not internal[info(i, "s")] then
+				seen += 1
+				if seen == level then
+					return fn
+				end
+			end
+			i += 1
 		end
 	end
 
-	-- DynamicEnv SETGLOBAL.
-	function Values.SetGlobalDyn(A: number, ENV: string, K: string, Next: Handler, Chain: boolean): Handler
-		return function(S)
-			S[1][ENV][K] = S[A]
-			return if Chain then Next(S) else Next
-		end
-	end
+	-- Creates a dynamic environment state. Level 0 is the running thread's globals, as on the host.
+	function Env.New(): EnvState
+		local state: EnvState
+		state = {
+			Unsafe = setmetatable({}, { __mode = "k" }) :: any,
+			Owners = setmetatable({}, { __mode = "k" }) :: any,
+			getfenv = nil :: any,
+			setfenv = nil :: any,
+		}
 
-	-- DynamicEnv GETIMPORT: the load-time value while the closure's environment is the load environment and has
-	-- never been exposed through getfenv/setfenv; otherwise the path is walked, as the host's safe-env check does.
-	-- @param Resolved any – value resolved at load (nil when it was not resolvable)
-	-- @param LoadEnv table – environment the value was resolved in
-	-- @param Unsafe { [any]: boolean } – exposed environments
-	-- @param Swaps { [any]: any }? – values replaced when read
-	function Values.GetImportDyn(A: number, ENV: string, Path: { string }, Resolved: any, LoadEnv: any, Unsafe: { [any]: boolean }, Swaps: { [any]: any }?, Next: Handler, Chain: boolean): Handler
-		local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
-		return function(S)
-			local env = S[1][ENV]
-			local v
-			if Resolved ~= nil and env == LoadEnv and not Unsafe[env] then
-				v = Resolved
+		-- Environment of a function: its upvalue table's for VM closures; the thread's globals for C functions (the
+		-- VM-aware getfenv/setfenv stand in for C functions); the host's otherwise.
+		local function EnvOf(fn: any): any
+			local U = state.Owners[fn]
+			if U then
+				return U[ENV]
+			end
+			local src = info(fn, "s")
+			if src == "[C]" or internal[src] then
+				return hostGetfenv(0)
+			end
+			return hostGetfenv(fn)
+		end
+
+		-- Function at a level argument, with the host's argument errors (raised without a position, as by C).
+		-- @param name string – "getfenv" or "setfenv", for messages
+		-- @param target any – level argument
+		local function Resolve(name: string, target: any): (number, any)
+			local level = tonumber(target)
+			if level == nil then
+				error(`invalid argument #1 to '{name}' (number expected, got {typeof(target)})`, 0)
+			end
+			level = if level >= 0 then math.floor(level) else math.ceil(level)
+			if level < 0 then
+				error(`invalid argument #1 to '{name}' (level must be non-negative)`, 0)
+			elseif level == 0 then
+				return 0, nil
+			end
+			local fn = AtLevel(state.Owners, level)
+			if fn == nil then
+				error(`invalid argument #1 to '{name}' (invalid level)`, 0)
+			end
+			return level, fn
+		end
+
+		-- getfenv for guest code.
+		-- @param target any – level (default 1) or function
+		state.getfenv = function(target: any?): any
+			local env
+			if type(target) == "function" then
+				env = EnvOf(target)
 			else
-				v = env[k1]
-				if count > 1 then
-					v = v[k2]
-					if count > 2 then
-						v = v[k3]
-					end
+				local level, fn = Resolve("getfenv", if target == nil then 1 else target)
+				env = if level == 0 then hostGetfenv(0) else EnvOf(fn)
+			end
+			if type(env) == "table" then
+				state.Unsafe[env] = true
+			end
+			return env
+		end
+
+		-- setfenv for guest code; returns the function whose environment changed, as the host does.
+		state.setfenv = function(target: any, env: any): any
+			if type(env) ~= "table" then
+				error(`invalid argument #2 to 'setfenv' (table expected, got {typeof(env)})`, 0)
+			end
+			local fn = target
+			if type(target) ~= "function" then
+				local level
+				level, fn = Resolve("setfenv", target)
+				if level == 0 then
+					state.Unsafe[env] = true
+					hostSetfenv(0, env)
+					return nil
 				end
 			end
-			if Swaps and v ~= nil and Swaps[v] ~= nil then
-				v = Swaps[v]
+			state.Unsafe[env] = true
+			local U = state.Owners[fn]
+			if U then
+				U[ENV] = env
+				return fn
 			end
-			S[A] = v
-			return if Chain then Next(S) else Next
+			local src = info(fn, "s")
+			if src == "[C]" or internal[src] then
+				error("'setfenv' cannot change environment of given object", 0)
+			end
+			return hostSetfenv(fn, env)
 		end
+
+		return state
 	end
 
-	-- GETTABLEKS of "getfenv"/"setfenv" under DynamicEnv (e.g. _G.getfenv): hands out the VM-aware versions.
-	function Values.GetKSwapped(A: number, B: number, K: string, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
-		return function(S)
-			local v = S[B][K]
-			S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
-			return if Chain then Next(S) else Next
+	-- Swaps the host getfenv/setfenv for the state's versions when guest code reads them.
+	function Env.Swap(state: EnvState, value: any): any
+		if rawequal(value, hostGetfenv) then
+			return state.getfenv
+		elseif rawequal(value, hostSetfenv) then
+			return state.setfenv
 		end
+		return value
 	end
 
-	-- GETUPVAL for an upvalue captured by value.
-	-- @param B number – upvalue index (1-based)
-	function Values.GetUpval(A: number, B: number, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[A] = S[1][B]
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[A] = S[1][B]
-			return Next
-		end
-	end
+	Env.MarkInternal(Env.Swap)
 
-	-- GETUPVAL for an upvalue held in a shared cell.
-	function Values.GetUpvalCell(A: number, B: number, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				local cell = S[1][B]
-				S[A] = cell[1][cell[2]]
-				return Next(S)
-			end
-		end
-		return function(S)
-			local cell = S[1][B]
-			S[A] = cell[1][cell[2]]
-			return Next
-		end
-	end
-
-	-- SETUPVAL for a cell; a by-value upvalue is never written by compiled code but is handled for safety.
-	-- @param IsCell boolean – whether upvalue B is a cell
-	function Values.SetUpval(A: number, B: number, IsCell: boolean, Next: Handler, Chain: boolean): Handler
-		if not IsCell then
-			return function(S)
-				S[1][B] = S[A]
-				return if Chain then Next(S) else Next
-			end
-		end
-		if Chain then
-			return function(S)
-				local cell = S[1][B]
-				cell[1][cell[2]] = S[A]
-				return Next(S)
-			end
-		end
-		return function(S)
-			local cell = S[1][B]
-			cell[1][cell[2]] = S[A]
-			return Next
-		end
-	end
-
-	-- CLOSEUPVALS: detaches cells of registers leaving scope so later iterations get fresh variables.
-	function Values.CloseUpvals(A: number, Next: Handler, Chain: boolean): Handler
-		local Close = Runtime.Close
-		return function(S)
-			if S[4] ~= nil then
-				Close(S, A)
-			end
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	-- GETVARARGS with a fixed count: copies varargs, padding with nil.
-	-- @param Count number – values to copy
-	function Values.GetVarargs(A: number, Count: number, Next: Handler, Chain: boolean): Handler
-		if Count == 1 then
-			if Chain then
-				return function(S)
-					S[A] = S[2][1]
-					return Next(S)
-				end
-			end
-			return function(S)
-				S[A] = S[2][1]
-				return Next
-			end
-		end
-		return function(S)
-			local v = S[2]
-			for i = 1, Count do
-				S[A + i - 1] = v[i]
-			end
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	-- GETVARARGS with MULTRET: copies every vararg and sets top.
-	function Values.GetVarargsAll(A: number, Next: Handler, Chain: boolean): Handler
-		return function(S)
-			local n = S[3]
-			move(S[2], 1, n, A, S)
-			S[TOP] = A + n - 1
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	return Values
+	return Env
 end)()
 
 -- Ops/Arith.luau
@@ -3090,152 +2493,255 @@ local Module_Arith = (function()
 	return Arith
 end)()
 
--- Ops/Tables.luau
-local Module_Tables = (function()
-	-- Table construction and indexing handlers.
-	-- Indexing is native so __index/__newindex and userdata (e.g. Instances) behave exactly as in host code.
-	-- @param Next Handler – successor, or a loop token in returning mode
-	-- @param Chain boolean – whether to call Next directly
+-- Ops/Branches.luau
+local Module_Branches = (function()
+	-- Conditional branch handlers.
+	-- Negated opcodes are built by swapping successors, so each condition is written once.
+	-- Each successor is either chained (called) or returned to a trampoline, giving four variants per condition.
+	-- @param N Handler – fallthrough successor (or loop token)
+	-- @param NC boolean – whether N is chained
+	-- @param T Handler – branch target (or loop token)
+	-- @param TC boolean – whether T is chained
 
 	local Runtime = Module_Runtime
 
 
-	local create = table.create
-	local clone = table.clone
-	local move = table.move
-	local TOP = Runtime.TOP
+	local COUNT, RET_ONE = Runtime.COUNT, Runtime.RET_ONE
 
-	local Tables = {}
+	local Branches = {}
 
-	-- GETTABLE: A = B[C] with a register key.
-	function Tables.Get(A: number, B: number, C: number, Next: Handler, Chain: boolean): Handler
+	-- JUMPIF: branch when A is truthy.
+	function Branches.Truthy(A: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+		if NC and TC then
+			return function(S)
+				if S[A] then
+					return T(S)
+				end
+				return N(S)
+			end
+		elseif NC then
+			return function(S)
+				if S[A] then
+					return T
+				end
+				return N(S)
+			end
+		elseif TC then
+			return function(S)
+				if S[A] then
+					return T(S)
+				end
+				return N
+			end
+		end
+		return function(S)
+			if S[A] then
+				return T
+			end
+			return N
+		end
+	end
+
+	-- JUMPIFEQ: branch when A == B (native equality, so __eq applies).
+	function Branches.Eq(A: number, B: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+		if NC and TC then
+			return function(S)
+				if S[A] == S[B] then
+					return T(S)
+				end
+				return N(S)
+			end
+		elseif NC then
+			return function(S)
+				if S[A] == S[B] then
+					return T
+				end
+				return N(S)
+			end
+		elseif TC then
+			return function(S)
+				if S[A] == S[B] then
+					return T(S)
+				end
+				return N
+			end
+		end
+		return function(S)
+			if S[A] == S[B] then
+				return T
+			end
+			return N
+		end
+	end
+
+	-- JUMPIFLE: branch when A <= B.
+	function Branches.Le(A: number, B: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+		if NC and TC then
+			return function(S)
+				if S[A] <= S[B] then
+					return T(S)
+				end
+				return N(S)
+			end
+		elseif NC then
+			return function(S)
+				if S[A] <= S[B] then
+					return T
+				end
+				return N(S)
+			end
+		elseif TC then
+			return function(S)
+				if S[A] <= S[B] then
+					return T(S)
+				end
+				return N
+			end
+		end
+		return function(S)
+			if S[A] <= S[B] then
+				return T
+			end
+			return N
+		end
+	end
+
+	-- JUMPIFLT: branch when A < B.
+	function Branches.Lt(A: number, B: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+		if NC and TC then
+			return function(S)
+				if S[A] < S[B] then
+					return T(S)
+				end
+				return N(S)
+			end
+		elseif NC then
+			return function(S)
+				if S[A] < S[B] then
+					return T
+				end
+				return N(S)
+			end
+		elseif TC then
+			return function(S)
+				if S[A] < S[B] then
+					return T(S)
+				end
+				return N
+			end
+		end
+		return function(S)
+			if S[A] < S[B] then
+				return T
+			end
+			return N
+		end
+	end
+
+	-- JUMPXEQK*: branch when A equals a constant (nil, boolean, number or string).
+	-- @param K any – constant compared with raw-equivalent native ==
+	function Branches.EqK(A: number, K: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
+		if NC and TC then
+			return function(S)
+				if S[A] == K then
+					return T(S)
+				end
+				return N(S)
+			end
+		elseif NC then
+			return function(S)
+				if S[A] == K then
+					return T
+				end
+				return N(S)
+			end
+		elseif TC then
+			return function(S)
+				if S[A] == K then
+					return T(S)
+				end
+				return N
+			end
+		end
+		return function(S)
+			if S[A] == K then
+				return T
+			end
+			return N
+		end
+	end
+
+	-- Builds the condition of a boolean-materializing branch as a function of the frame.
+	local function Test(Kind: string, A: number, B: any, Negate: boolean): (any) -> boolean
+		if Kind == "truthy" then
+			return if Negate then function(S) return not S[A] end else function(S) return not not S[A] end
+		elseif Kind == "eq" then
+			return if Negate then function(S) return S[A] ~= S[B] end else function(S) return S[A] == S[B] end
+		elseif Kind == "le" then
+			return if Negate then function(S) return not (S[A] <= S[B]) end else function(S) return S[A] <= S[B] end
+		elseif Kind == "lt" then
+			return if Negate then function(S) return not (S[A] < S[B]) end else function(S) return S[A] < S[B] end
+		end
+		return if Negate then function(S) return S[A] ~= B end else function(S) return S[A] == B end
+	end
+
+	-- A branch whose successors only load opposite booleans into R (`x = a < b`): stores the condition instead.
+	-- @param Kind string – "truthy", "eq", "le", "lt" or "eqk"
+	-- @param R number – frame index receiving the boolean
+	-- @param B any – right operand frame index, or the constant for "eqk"
+	-- @param Negate boolean – whether the stored value is the condition's negation
+	function Branches.Store(Kind: string, R: number, A: number, B: any, Negate: boolean, Next: Handler, Chain: boolean): Handler
+		local test = Test(Kind, A, B, Negate)
+		-- the comparison itself is the expensive part; one extra call keeps this table of variants small
 		if Chain then
 			return function(S)
-				S[A] = S[B][S[C]]
+				S[R] = test(S)
 				return Next(S)
 			end
 		end
 		return function(S)
-			S[A] = S[B][S[C]]
+			S[R] = test(S)
 			return Next
 		end
 	end
 
-	-- SETTABLE: B[C] = A with a register key.
-	function Tables.Set(A: number, B: number, C: number, Next: Handler, Chain: boolean): Handler
-		if Chain then
+	-- Store followed by `return R`: ends the function with the condition as its single result.
+	function Branches.StoreReturn(Kind: string, A: number, B: any, Negate: boolean): Handler
+		if Kind == "lt" and not Negate then
 			return function(S)
-				S[B][S[C]] = S[A]
-				return Next(S)
+				S[1] = S[A] < S[B]
+				S[COUNT] = RET_ONE
+				return nil
+			end
+		elseif Kind == "le" and not Negate then
+			return function(S)
+				S[1] = S[A] <= S[B]
+				S[COUNT] = RET_ONE
+				return nil
+			end
+		elseif Kind == "eq" then
+			if Negate then
+				return function(S)
+					S[1] = S[A] ~= S[B]
+					S[COUNT] = RET_ONE
+					return nil
+				end
+			end
+			return function(S)
+				S[1] = S[A] == S[B]
+				S[COUNT] = RET_ONE
+				return nil
 			end
 		end
+		local test = Test(Kind, A, B, Negate)
 		return function(S)
-			S[B][S[C]] = S[A]
-			return Next
+			S[1] = test(S)
+			S[COUNT] = RET_ONE
+			return nil
 		end
 	end
 
-	-- GETTABLEKS / GETTABLEN: A = B[K] with a constant key.
-	-- @param K any – string or small integer key
-	function Tables.GetK(A: number, B: number, K: any, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[A] = S[B][K]
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[A] = S[B][K]
-			return Next
-		end
-	end
-
-	-- SETTABLEKS / SETTABLEN: B[K] = A with a constant key.
-	function Tables.SetK(A: number, B: number, K: any, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[B][K] = S[A]
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[B][K] = S[A]
-			return Next
-		end
-	end
-
-	-- NEWTABLE: presizes the table like the host's luaH_new.
-	-- A hash-only constructor clones an empty presized template, so keys inserted by the constructor land in the
-	-- same nodes (and iterate in the same order) as on the host.
-	-- @param Size number – array size hint
-	-- @param HashSize number – hash size hint (0 when none)
-	-- Allocating handlers clear A first: the host collects after the instruction, once A holds the new value, while
-	-- here the collection step runs before the store, and the old value must not survive it.
-	function Tables.New(A: number, Size: number, HashSize: number, Next: Handler, Chain: boolean): Handler
-		if HashSize > 0 and Size == 0 then
-			local template = Runtime.PresizedHash(HashSize)
-			return function(S)
-				S[A] = nil
-				S[A] = clone(template)
-				return if Chain then Next(S) else Next
-			end
-		elseif Size > 0 then
-			return function(S)
-				S[A] = nil
-				S[A] = create(Size)
-				return if Chain then Next(S) else Next
-			end
-		end
-		if Chain then
-			return function(S)
-				S[A] = nil
-				S[A] = {}
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[A] = nil
-			S[A] = {}
-			return Next
-		end
-	end
-
-	-- DUPTABLE: clones a constructor template so field slots are presized and constant fields prefilled.
-	-- @param Template table – shape built by the deserializer
-	function Tables.Dup(A: number, Template: any, Next: Handler, Chain: boolean): Handler
-		if Chain then
-			return function(S)
-				S[A] = nil
-				S[A] = clone(Template)
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[A] = nil
-			S[A] = clone(Template)
-			return Next
-		end
-	end
-
-	-- SETLIST with a fixed count: stores B..B+Count-1 into A starting at Index.
-	-- @param Index number – first array index
-	function Tables.SetList(A: number, B: number, Count: number, Index: number, Next: Handler, Chain: boolean): Handler
-		local last = B + Count - 1
-		return function(S)
-			move(S, B, last, Index, S[A])
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	-- SETLIST with MULTRET: stores B..top into A.
-	function Tables.SetListAll(A: number, B: number, Index: number, Next: Handler, Chain: boolean): Handler
-		return function(S)
-			move(S, B, S[TOP], Index, S[A])
-			return if Chain then Next(S) else Next
-		end
-	end
-
-	return Tables
+	return Branches
 end)()
 
 -- Ops/Calls.luau
@@ -3815,444 +3321,6 @@ local Module_Calls = (function()
 	end
 
 	return Calls
-end)()
-
--- Ops/Branches.luau
-local Module_Branches = (function()
-	-- Conditional branch handlers.
-	-- Negated opcodes are built by swapping successors, so each condition is written once.
-	-- Each successor is either chained (called) or returned to a trampoline, giving four variants per condition.
-	-- @param N Handler – fallthrough successor (or loop token)
-	-- @param NC boolean – whether N is chained
-	-- @param T Handler – branch target (or loop token)
-	-- @param TC boolean – whether T is chained
-
-	local Runtime = Module_Runtime
-
-
-	local COUNT, RET_ONE = Runtime.COUNT, Runtime.RET_ONE
-
-	local Branches = {}
-
-	-- JUMPIF: branch when A is truthy.
-	function Branches.Truthy(A: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
-		if NC and TC then
-			return function(S)
-				if S[A] then
-					return T(S)
-				end
-				return N(S)
-			end
-		elseif NC then
-			return function(S)
-				if S[A] then
-					return T
-				end
-				return N(S)
-			end
-		elseif TC then
-			return function(S)
-				if S[A] then
-					return T(S)
-				end
-				return N
-			end
-		end
-		return function(S)
-			if S[A] then
-				return T
-			end
-			return N
-		end
-	end
-
-	-- JUMPIFEQ: branch when A == B (native equality, so __eq applies).
-	function Branches.Eq(A: number, B: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
-		if NC and TC then
-			return function(S)
-				if S[A] == S[B] then
-					return T(S)
-				end
-				return N(S)
-			end
-		elseif NC then
-			return function(S)
-				if S[A] == S[B] then
-					return T
-				end
-				return N(S)
-			end
-		elseif TC then
-			return function(S)
-				if S[A] == S[B] then
-					return T(S)
-				end
-				return N
-			end
-		end
-		return function(S)
-			if S[A] == S[B] then
-				return T
-			end
-			return N
-		end
-	end
-
-	-- JUMPIFLE: branch when A <= B.
-	function Branches.Le(A: number, B: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
-		if NC and TC then
-			return function(S)
-				if S[A] <= S[B] then
-					return T(S)
-				end
-				return N(S)
-			end
-		elseif NC then
-			return function(S)
-				if S[A] <= S[B] then
-					return T
-				end
-				return N(S)
-			end
-		elseif TC then
-			return function(S)
-				if S[A] <= S[B] then
-					return T(S)
-				end
-				return N
-			end
-		end
-		return function(S)
-			if S[A] <= S[B] then
-				return T
-			end
-			return N
-		end
-	end
-
-	-- JUMPIFLT: branch when A < B.
-	function Branches.Lt(A: number, B: number, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
-		if NC and TC then
-			return function(S)
-				if S[A] < S[B] then
-					return T(S)
-				end
-				return N(S)
-			end
-		elseif NC then
-			return function(S)
-				if S[A] < S[B] then
-					return T
-				end
-				return N(S)
-			end
-		elseif TC then
-			return function(S)
-				if S[A] < S[B] then
-					return T(S)
-				end
-				return N
-			end
-		end
-		return function(S)
-			if S[A] < S[B] then
-				return T
-			end
-			return N
-		end
-	end
-
-	-- JUMPXEQK*: branch when A equals a constant (nil, boolean, number or string).
-	-- @param K any – constant compared with raw-equivalent native ==
-	function Branches.EqK(A: number, K: any, N: Handler, NC: boolean, T: Handler, TC: boolean): Handler
-		if NC and TC then
-			return function(S)
-				if S[A] == K then
-					return T(S)
-				end
-				return N(S)
-			end
-		elseif NC then
-			return function(S)
-				if S[A] == K then
-					return T
-				end
-				return N(S)
-			end
-		elseif TC then
-			return function(S)
-				if S[A] == K then
-					return T(S)
-				end
-				return N
-			end
-		end
-		return function(S)
-			if S[A] == K then
-				return T
-			end
-			return N
-		end
-	end
-
-	-- Builds the condition of a boolean-materializing branch as a function of the frame.
-	local function Test(Kind: string, A: number, B: any, Negate: boolean): (any) -> boolean
-		if Kind == "truthy" then
-			return if Negate then function(S) return not S[A] end else function(S) return not not S[A] end
-		elseif Kind == "eq" then
-			return if Negate then function(S) return S[A] ~= S[B] end else function(S) return S[A] == S[B] end
-		elseif Kind == "le" then
-			return if Negate then function(S) return not (S[A] <= S[B]) end else function(S) return S[A] <= S[B] end
-		elseif Kind == "lt" then
-			return if Negate then function(S) return not (S[A] < S[B]) end else function(S) return S[A] < S[B] end
-		end
-		return if Negate then function(S) return S[A] ~= B end else function(S) return S[A] == B end
-	end
-
-	-- A branch whose successors only load opposite booleans into R (`x = a < b`): stores the condition instead.
-	-- @param Kind string – "truthy", "eq", "le", "lt" or "eqk"
-	-- @param R number – frame index receiving the boolean
-	-- @param B any – right operand frame index, or the constant for "eqk"
-	-- @param Negate boolean – whether the stored value is the condition's negation
-	function Branches.Store(Kind: string, R: number, A: number, B: any, Negate: boolean, Next: Handler, Chain: boolean): Handler
-		local test = Test(Kind, A, B, Negate)
-		-- the comparison itself is the expensive part; one extra call keeps this table of variants small
-		if Chain then
-			return function(S)
-				S[R] = test(S)
-				return Next(S)
-			end
-		end
-		return function(S)
-			S[R] = test(S)
-			return Next
-		end
-	end
-
-	-- Store followed by `return R`: ends the function with the condition as its single result.
-	function Branches.StoreReturn(Kind: string, A: number, B: any, Negate: boolean): Handler
-		if Kind == "lt" and not Negate then
-			return function(S)
-				S[1] = S[A] < S[B]
-				S[COUNT] = RET_ONE
-				return nil
-			end
-		elseif Kind == "le" and not Negate then
-			return function(S)
-				S[1] = S[A] <= S[B]
-				S[COUNT] = RET_ONE
-				return nil
-			end
-		elseif Kind == "eq" then
-			if Negate then
-				return function(S)
-					S[1] = S[A] ~= S[B]
-					S[COUNT] = RET_ONE
-					return nil
-				end
-			end
-			return function(S)
-				S[1] = S[A] == S[B]
-				S[COUNT] = RET_ONE
-				return nil
-			end
-		end
-		local test = Test(Kind, A, B, Negate)
-		return function(S)
-			S[1] = test(S)
-			S[COUNT] = RET_ONE
-			return nil
-		end
-	end
-
-	return Branches
-end)()
-
--- Ops/Loops.luau
-local Module_Loops = (function()
-	-- Loop handlers: every bytecode loop runs as a real host loop.
-	-- Numeric and generic for loops use the host's own for statements (including its next/inext fast paths and
-	-- generalized iteration); other loops run their body in a local trampoline.
-	--
-	-- Body protocol: the body returns Token to continue, nil when the function returned, a member handler when it
-	-- bounced inside the loop, or anything else when control leaves the loop (break, outer continue, exit).
-	-- @param Body Handler – first handler of the loop body
-	-- @param Token any – value the body returns to start the next iteration
-	-- @param Members { [Handler]: boolean } – handlers the body may bounce to without leaving the loop
-	-- @param Exit Handler – successor after normal termination
-	-- @param Chain boolean – whether Exit is chained
-
-
-
-	local pack = table.pack
-	local move = table.move
-	local getmetatable = getmetatable
-	local next = next
-
-	local Loops = {}
-
-	-- Runs body bounces until the iteration ends; returns Token to continue or the value that leaves the loop.
-	local function Settle(S: { any }, f: any, Token: any, Members: { [any]: boolean }): any
-		while Members[f] do
-			f = f(S)
-			if f == Token then
-				return f
-			end
-		end
-		return f
-	end
-
-	-- FORNPREP/FORNLOOP: runs a host numeric for; the setup operands may be registers or constant slots.
-	-- @param I number – frame index of the visible loop variable
-	-- @param Limit number – frame index of the limit
-	-- @param Step number – frame index of the step
-	-- @param Start number – frame index of the initial value
-	-- @param Empty Handler? – successor when the loop runs zero times, when the compiler gave it its own exit
-	-- @param EmptyChain boolean? – whether Empty is chained
-	function Loops.Numeric(I: number, Limit: number, Step: number, Start: number, Body: Handler, Token: any, Members: { [any]: boolean }, Exit: Handler, Chain: boolean, Empty: Handler?, EmptyChain: boolean?): Handler
-		if Empty then
-			return function(S)
-				local entered = false
-				for i = S[Start], S[Limit], S[Step] do
-					entered = true
-					S[I] = i
-					local f = Body(S)
-					if f ~= Token then
-						f = Settle(S, f, Token, Members)
-						if f ~= Token then
-							return f
-						end
-					end
-				end
-				if not entered then
-					return if EmptyChain then (Empty :: Handler)(S) else Empty
-				end
-				return if Chain then Exit(S) else Exit
-			end
-		end
-		return function(S)
-			for i = S[Start], S[Limit], S[Step] do
-				S[I] = i
-				local f = Body(S)
-				if f ~= Token then
-					f = Settle(S, f, Token, Members)
-					if f ~= Token then
-						return f
-					end
-				end
-			end
-			if Chain then
-				return Exit(S)
-			end
-			return Exit
-		end
-	end
-
-	-- FORGPREP*/FORGLOOP: registers A generator, A+1 state, A+2 control, variables from A+3.
-	-- @param Count number – loop variable count
-	function Loops.Generic(A: number, Count: number, Body: Handler, Token: any, Members: { [any]: boolean }, Exit: Handler, Chain: boolean): Handler
-		local A1, A2, A3, A4, A5 = A + 1, A + 2, A + 3, A + 4, A + 5
-		local function Leave(S: { any }): any
-			if Chain then
-				return Exit(S)
-			end
-			return Exit
-		end
-
-		if Count == 1 then
-			return function(S)
-				for a in S[A], S[A1], S[A2] do
-					S[A3] = a
-					local f = Body(S)
-					if f ~= Token then
-						f = Settle(S, f, Token, Members)
-						if f ~= Token then
-							return f
-						end
-					end
-				end
-				return Leave(S)
-			end
-		elseif Count == 2 then
-			return function(S)
-				for a, b in S[A], S[A1], S[A2] do
-					S[A3], S[A4] = a, b
-					local f = Body(S)
-					if f ~= Token then
-						f = Settle(S, f, Token, Members)
-						if f ~= Token then
-							return f
-						end
-					end
-				end
-				return Leave(S)
-			end
-		elseif Count == 3 then
-			return function(S)
-				for a, b, c in S[A], S[A1], S[A2] do
-					S[A3], S[A4], S[A5] = a, b, c
-					local f = Body(S)
-					if f ~= Token then
-						f = Settle(S, f, Token, Members)
-						if f ~= Token then
-							return f
-						end
-					end
-				end
-				return Leave(S)
-			end
-		end
-
-		-- wide loops: generalized iteration done by hand (tables iterate like next, __iter is honoured)
-		return function(S)
-			local gen, state, control = S[A], S[A1], S[A2]
-			if type(gen) ~= "function" then
-				local mt = getmetatable(gen)
-				local iter = if type(mt) == "table" then mt.__iter else nil
-				if iter then
-					gen, state, control = iter(gen)
-				elseif type(gen) == "table" then
-					gen, state, control = next, gen, nil
-				else
-					error(`attempt to iterate over a {typeof(gen)} value`)
-				end
-			end
-			while true do
-				local values = pack(gen(state, control))
-				control = values[1]
-				if control == nil then
-					break
-				end
-				move(values, 1, Count, A3, S)
-				local f = Body(S)
-				if f ~= Token then
-					f = Settle(S, f, Token, Members)
-					if f ~= Token then
-						return f
-					end
-				end
-			end
-			return Leave(S)
-		end
-	end
-
-	-- Loops closed by a backward jump (while, repeat, goto-free continue): the body restarts on Token.
-	function Loops.Back(Body: Handler, Token: any, Members: { [any]: boolean }): Handler
-		return function(S)
-			local f = Body(S)
-			while true do
-				if f == Token then
-					f = Body(S)
-				elseif Members[f] then
-					f = f(S)
-				else
-					return f
-				end
-			end
-		end
-	end
-
-	return Loops
 end)()
 
 -- Ops/Closures.luau
@@ -6579,6 +5647,193 @@ local Module_Fused = (function()
 	return Fused
 end)()
 
+-- Ops/Loops.luau
+local Module_Loops = (function()
+	-- Loop handlers: every bytecode loop runs as a real host loop.
+	-- Numeric and generic for loops use the host's own for statements (including its next/inext fast paths and
+	-- generalized iteration); other loops run their body in a local trampoline.
+	--
+	-- Body protocol: the body returns Token to continue, nil when the function returned, a member handler when it
+	-- bounced inside the loop, or anything else when control leaves the loop (break, outer continue, exit).
+	-- @param Body Handler – first handler of the loop body
+	-- @param Token any – value the body returns to start the next iteration
+	-- @param Members { [Handler]: boolean } – handlers the body may bounce to without leaving the loop
+	-- @param Exit Handler – successor after normal termination
+	-- @param Chain boolean – whether Exit is chained
+
+
+
+	local pack = table.pack
+	local move = table.move
+	local getmetatable = getmetatable
+	local next = next
+
+	local Loops = {}
+
+	-- Runs body bounces until the iteration ends; returns Token to continue or the value that leaves the loop.
+	local function Settle(S: { any }, f: any, Token: any, Members: { [any]: boolean }): any
+		while Members[f] do
+			f = f(S)
+			if f == Token then
+				return f
+			end
+		end
+		return f
+	end
+
+	-- FORNPREP/FORNLOOP: runs a host numeric for; the setup operands may be registers or constant slots.
+	-- @param I number – frame index of the visible loop variable
+	-- @param Limit number – frame index of the limit
+	-- @param Step number – frame index of the step
+	-- @param Start number – frame index of the initial value
+	-- @param Empty Handler? – successor when the loop runs zero times, when the compiler gave it its own exit
+	-- @param EmptyChain boolean? – whether Empty is chained
+	function Loops.Numeric(I: number, Limit: number, Step: number, Start: number, Body: Handler, Token: any, Members: { [any]: boolean }, Exit: Handler, Chain: boolean, Empty: Handler?, EmptyChain: boolean?): Handler
+		if Empty then
+			return function(S)
+				local entered = false
+				for i = S[Start], S[Limit], S[Step] do
+					entered = true
+					S[I] = i
+					local f = Body(S)
+					if f ~= Token then
+						f = Settle(S, f, Token, Members)
+						if f ~= Token then
+							return f
+						end
+					end
+				end
+				if not entered then
+					return if EmptyChain then (Empty :: Handler)(S) else Empty
+				end
+				return if Chain then Exit(S) else Exit
+			end
+		end
+		return function(S)
+			for i = S[Start], S[Limit], S[Step] do
+				S[I] = i
+				local f = Body(S)
+				if f ~= Token then
+					f = Settle(S, f, Token, Members)
+					if f ~= Token then
+						return f
+					end
+				end
+			end
+			if Chain then
+				return Exit(S)
+			end
+			return Exit
+		end
+	end
+
+	-- FORGPREP*/FORGLOOP: registers A generator, A+1 state, A+2 control, variables from A+3.
+	-- @param Count number – loop variable count
+	function Loops.Generic(A: number, Count: number, Body: Handler, Token: any, Members: { [any]: boolean }, Exit: Handler, Chain: boolean): Handler
+		local A1, A2, A3, A4, A5 = A + 1, A + 2, A + 3, A + 4, A + 5
+		local function Leave(S: { any }): any
+			if Chain then
+				return Exit(S)
+			end
+			return Exit
+		end
+
+		if Count == 1 then
+			return function(S)
+				for a in S[A], S[A1], S[A2] do
+					S[A3] = a
+					local f = Body(S)
+					if f ~= Token then
+						f = Settle(S, f, Token, Members)
+						if f ~= Token then
+							return f
+						end
+					end
+				end
+				return Leave(S)
+			end
+		elseif Count == 2 then
+			return function(S)
+				for a, b in S[A], S[A1], S[A2] do
+					S[A3], S[A4] = a, b
+					local f = Body(S)
+					if f ~= Token then
+						f = Settle(S, f, Token, Members)
+						if f ~= Token then
+							return f
+						end
+					end
+				end
+				return Leave(S)
+			end
+		elseif Count == 3 then
+			return function(S)
+				for a, b, c in S[A], S[A1], S[A2] do
+					S[A3], S[A4], S[A5] = a, b, c
+					local f = Body(S)
+					if f ~= Token then
+						f = Settle(S, f, Token, Members)
+						if f ~= Token then
+							return f
+						end
+					end
+				end
+				return Leave(S)
+			end
+		end
+
+		-- wide loops: generalized iteration done by hand (tables iterate like next, __iter is honoured)
+		return function(S)
+			local gen, state, control = S[A], S[A1], S[A2]
+			if type(gen) ~= "function" then
+				local mt = getmetatable(gen)
+				local iter = if type(mt) == "table" then mt.__iter else nil
+				if iter then
+					gen, state, control = iter(gen)
+				elseif type(gen) == "table" then
+					gen, state, control = next, gen, nil
+				else
+					error(`attempt to iterate over a {typeof(gen)} value`)
+				end
+			end
+			while true do
+				local values = pack(gen(state, control))
+				control = values[1]
+				if control == nil then
+					break
+				end
+				move(values, 1, Count, A3, S)
+				local f = Body(S)
+				if f ~= Token then
+					f = Settle(S, f, Token, Members)
+					if f ~= Token then
+						return f
+					end
+				end
+			end
+			return Leave(S)
+		end
+	end
+
+	-- Loops closed by a backward jump (while, repeat, goto-free continue): the body restarts on Token.
+	function Loops.Back(Body: Handler, Token: any, Members: { [any]: boolean }): Handler
+		return function(S)
+			local f = Body(S)
+			while true do
+				if f == Token then
+					f = Body(S)
+				elseif Members[f] then
+					f = f(S)
+				else
+					return f
+				end
+			end
+		end
+	end
+
+	return Loops
+end)()
+
 -- Ops/Objects.luau
 local Module_Objects = (function()
 	-- Class instruction handlers: NEWCLASS, NEWCLASSMEMBER, CONSTRUCT, GETPRIVATEFIELD, SETPRIVATEFIELD.
@@ -6702,6 +5957,454 @@ local Module_Objects = (function()
 	end
 
 	return Objects
+end)()
+
+-- Ops/Tables.luau
+local Module_Tables = (function()
+	-- Table construction and indexing handlers.
+	-- Indexing is native so __index/__newindex and userdata (e.g. Instances) behave exactly as in host code.
+	-- @param Next Handler – successor, or a loop token in returning mode
+	-- @param Chain boolean – whether to call Next directly
+
+	local Runtime = Module_Runtime
+
+
+	local create = table.create
+	local clone = table.clone
+	local move = table.move
+	local TOP = Runtime.TOP
+
+	local Tables = {}
+
+	-- GETTABLE: A = B[C] with a register key.
+	function Tables.Get(A: number, B: number, C: number, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = S[B][S[C]]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = S[B][S[C]]
+			return Next
+		end
+	end
+
+	-- SETTABLE: B[C] = A with a register key.
+	function Tables.Set(A: number, B: number, C: number, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[B][S[C]] = S[A]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[B][S[C]] = S[A]
+			return Next
+		end
+	end
+
+	-- GETTABLEKS / GETTABLEN: A = B[K] with a constant key.
+	-- @param K any – string or small integer key
+	function Tables.GetK(A: number, B: number, K: any, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = S[B][K]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = S[B][K]
+			return Next
+		end
+	end
+
+	-- SETTABLEKS / SETTABLEN: B[K] = A with a constant key.
+	function Tables.SetK(A: number, B: number, K: any, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[B][K] = S[A]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[B][K] = S[A]
+			return Next
+		end
+	end
+
+	-- NEWTABLE: presizes the table like the host's luaH_new.
+	-- A hash-only constructor clones an empty presized template, so keys inserted by the constructor land in the
+	-- same nodes (and iterate in the same order) as on the host.
+	-- @param Size number – array size hint
+	-- @param HashSize number – hash size hint (0 when none)
+	-- Allocating handlers clear A first: the host collects after the instruction, once A holds the new value, while
+	-- here the collection step runs before the store, and the old value must not survive it.
+	function Tables.New(A: number, Size: number, HashSize: number, Next: Handler, Chain: boolean): Handler
+		if HashSize > 0 and Size == 0 then
+			local template = Runtime.PresizedHash(HashSize)
+			return function(S)
+				S[A] = nil
+				S[A] = clone(template)
+				return if Chain then Next(S) else Next
+			end
+		elseif Size > 0 then
+			return function(S)
+				S[A] = nil
+				S[A] = create(Size)
+				return if Chain then Next(S) else Next
+			end
+		end
+		if Chain then
+			return function(S)
+				S[A] = nil
+				S[A] = {}
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = nil
+			S[A] = {}
+			return Next
+		end
+	end
+
+	-- DUPTABLE: clones a constructor template so field slots are presized and constant fields prefilled.
+	-- @param Template table – shape built by the deserializer
+	function Tables.Dup(A: number, Template: any, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = nil
+				S[A] = clone(Template)
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = nil
+			S[A] = clone(Template)
+			return Next
+		end
+	end
+
+	-- SETLIST with a fixed count: stores B..B+Count-1 into A starting at Index.
+	-- @param Index number – first array index
+	function Tables.SetList(A: number, B: number, Count: number, Index: number, Next: Handler, Chain: boolean): Handler
+		local last = B + Count - 1
+		return function(S)
+			move(S, B, last, Index, S[A])
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- SETLIST with MULTRET: stores B..top into A.
+	function Tables.SetListAll(A: number, B: number, Index: number, Next: Handler, Chain: boolean): Handler
+		return function(S)
+			move(S, B, S[TOP], Index, S[A])
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	return Tables
+end)()
+
+-- Ops/Values.luau
+local Module_Values = (function()
+	-- Handlers that move values: constants, registers, globals, upvalues and varargs.
+	-- Each maker returns a chained handler (calls its successor) or a returning one (hands the successor back to a trampoline).
+	-- @param Next Handler – successor, or a loop token in returning mode
+	-- @param Chain boolean – whether to call Next directly
+
+	local Runtime = Module_Runtime
+
+
+	local move = table.move
+	local TOP = Runtime.TOP
+
+	local Values = {}
+
+	-- LOADNIL/LOADB/LOADN/LOADK/LOADKX and pre-resolved GETIMPORT: stores a value known at load time.
+	-- @param A number – target frame index
+	-- @param K any – value to store
+	function Values.LoadK(A: number, K: any, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = K
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = K
+			return Next
+		end
+	end
+
+	-- MOVE: copies a register.
+	-- @param A number – target frame index
+	-- @param B number – source frame index
+	function Values.Move(A: number, B: number, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = S[B]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = S[B]
+			return Next
+		end
+	end
+
+	-- GETGLOBAL: reads a global from the chunk environment.
+	-- @param Env table – chunk environment
+	-- @param K string – global name
+	function Values.GetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = Env[K]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = Env[K]
+			return Next
+		end
+	end
+
+	-- GETGLOBAL of error/assert feeding a call: substitutes the call site's positioned wrapper for the real function.
+	-- @param Swaps { [any]: any } – real function -> wrapper
+	function Values.GetGlobalSwapped(A: number, Env: any, K: string, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
+		return function(S)
+			local v = Env[K]
+			S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- SETGLOBAL: writes a global into the chunk environment.
+	function Values.SetGlobal(A: number, Env: any, K: string, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				Env[K] = S[A]
+				return Next(S)
+			end
+		end
+		return function(S)
+			Env[K] = S[A]
+			return Next
+		end
+	end
+
+	-- GETIMPORT that could not be resolved at load: walks the path on every execution.
+	-- Indexing a missing step raises, as the host's run-time import fallback does.
+	-- @param Path { string } – one to three keys
+	function Values.GetImport(A: number, Env: any, Path: { string }, Next: Handler, Chain: boolean): Handler
+		local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
+		local function Resolve(): any
+			local v = Env[k1]
+			if count > 1 then
+				v = v[k2]
+				if count > 2 then
+					v = v[k3]
+				end
+			end
+			return v
+		end
+		if Chain then
+			return function(S)
+				S[A] = Resolve()
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = Resolve()
+			return Next
+		end
+	end
+
+	-- GETIMPORT walked per access, with values replaced when read (class-aware builtins).
+	-- @param Swaps { [any]: any } – host value -> replacement
+	function Values.GetImportSwapped(A: number, Env: any, Path: { string }, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
+		local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
+		return function(S)
+			local v = Env[k1]
+			if count > 1 then
+				v = v[k2]
+				if count > 2 then
+					v = v[k3]
+				end
+			end
+			if v ~= nil and Swaps[v] ~= nil then
+				v = Swaps[v]
+			end
+			S[A] = v
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- DynamicEnv GETGLOBAL: reads the running closure's environment.
+	-- @param ENV string – upvalue-table key of the environment
+	-- @param Swaps { [any]: any }? – values replaced when read (host getfenv/setfenv, positioned error/assert)
+	function Values.GetGlobalDyn(A: number, ENV: string, K: string, Swaps: { [any]: any }?, Next: Handler, Chain: boolean): Handler
+		if Swaps then
+			return function(S)
+				local v = S[1][ENV][K]
+				S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
+				return if Chain then Next(S) else Next
+			end
+		end
+		return function(S)
+			S[A] = S[1][ENV][K]
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- DynamicEnv SETGLOBAL.
+	function Values.SetGlobalDyn(A: number, ENV: string, K: string, Next: Handler, Chain: boolean): Handler
+		return function(S)
+			S[1][ENV][K] = S[A]
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- DynamicEnv GETIMPORT: the load-time value while the closure's environment is the load environment and has
+	-- never been exposed through getfenv/setfenv; otherwise the path is walked, as the host's safe-env check does.
+	-- @param Resolved any – value resolved at load (nil when it was not resolvable)
+	-- @param LoadEnv table – environment the value was resolved in
+	-- @param Unsafe { [any]: boolean } – exposed environments
+	-- @param Swaps { [any]: any }? – values replaced when read
+	function Values.GetImportDyn(A: number, ENV: string, Path: { string }, Resolved: any, LoadEnv: any, Unsafe: { [any]: boolean }, Swaps: { [any]: any }?, Next: Handler, Chain: boolean): Handler
+		local count, k1, k2, k3 = #Path, Path[1], Path[2], Path[3]
+		return function(S)
+			local env = S[1][ENV]
+			local v
+			if Resolved ~= nil and env == LoadEnv and not Unsafe[env] then
+				v = Resolved
+			else
+				v = env[k1]
+				if count > 1 then
+					v = v[k2]
+					if count > 2 then
+						v = v[k3]
+					end
+				end
+			end
+			if Swaps and v ~= nil and Swaps[v] ~= nil then
+				v = Swaps[v]
+			end
+			S[A] = v
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- GETTABLEKS of "getfenv"/"setfenv" under DynamicEnv (e.g. _G.getfenv): hands out the VM-aware versions.
+	function Values.GetKSwapped(A: number, B: number, K: string, Swaps: { [any]: any }, Next: Handler, Chain: boolean): Handler
+		return function(S)
+			local v = S[B][K]
+			S[A] = if v ~= nil and Swaps[v] ~= nil then Swaps[v] else v
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- GETUPVAL for an upvalue captured by value.
+	-- @param B number – upvalue index (1-based)
+	function Values.GetUpval(A: number, B: number, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				S[A] = S[1][B]
+				return Next(S)
+			end
+		end
+		return function(S)
+			S[A] = S[1][B]
+			return Next
+		end
+	end
+
+	-- GETUPVAL for an upvalue held in a shared cell.
+	function Values.GetUpvalCell(A: number, B: number, Next: Handler, Chain: boolean): Handler
+		if Chain then
+			return function(S)
+				local cell = S[1][B]
+				S[A] = cell[1][cell[2]]
+				return Next(S)
+			end
+		end
+		return function(S)
+			local cell = S[1][B]
+			S[A] = cell[1][cell[2]]
+			return Next
+		end
+	end
+
+	-- SETUPVAL for a cell; a by-value upvalue is never written by compiled code but is handled for safety.
+	-- @param IsCell boolean – whether upvalue B is a cell
+	function Values.SetUpval(A: number, B: number, IsCell: boolean, Next: Handler, Chain: boolean): Handler
+		if not IsCell then
+			return function(S)
+				S[1][B] = S[A]
+				return if Chain then Next(S) else Next
+			end
+		end
+		if Chain then
+			return function(S)
+				local cell = S[1][B]
+				cell[1][cell[2]] = S[A]
+				return Next(S)
+			end
+		end
+		return function(S)
+			local cell = S[1][B]
+			cell[1][cell[2]] = S[A]
+			return Next
+		end
+	end
+
+	-- CLOSEUPVALS: detaches cells of registers leaving scope so later iterations get fresh variables.
+	function Values.CloseUpvals(A: number, Next: Handler, Chain: boolean): Handler
+		local Close = Runtime.Close
+		return function(S)
+			if S[4] ~= nil then
+				Close(S, A)
+			end
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- GETVARARGS with a fixed count: copies varargs, padding with nil.
+	-- @param Count number – values to copy
+	function Values.GetVarargs(A: number, Count: number, Next: Handler, Chain: boolean): Handler
+		if Count == 1 then
+			if Chain then
+				return function(S)
+					S[A] = S[2][1]
+					return Next(S)
+				end
+			end
+			return function(S)
+				S[A] = S[2][1]
+				return Next
+			end
+		end
+		return function(S)
+			local v = S[2]
+			for i = 1, Count do
+				S[A + i - 1] = v[i]
+			end
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	-- GETVARARGS with MULTRET: copies every vararg and sets top.
+	function Values.GetVarargsAll(A: number, Next: Handler, Chain: boolean): Handler
+		return function(S)
+			local n = S[3]
+			move(S[2], 1, n, A, S)
+			S[TOP] = A + n - 1
+			return if Chain then Next(S) else Next
+		end
+	end
+
+	return Values
 end)()
 
 -- Compiler.luau
@@ -7496,6 +7199,303 @@ local Module_Compiler = (function()
 	Env.MarkGuarded(Run)
 
 	return Compiler
+end)()
+
+-- Deserializer.luau
+local Module_Deserializer = (function()
+	-- Parses serialized Luau bytecode into plain proto records.
+	-- Pure data transform: no execution and no environment access, so it is safe on untrusted input.
+
+	local Runtime = Module_Runtime
+	local Classes = Module_Classes
+
+	local PresizedHash = Runtime.PresizedHash
+
+
+	local readu8 = buffer.readu8
+	local readu32 = buffer.readu32
+	local readf32 = buffer.readf32
+	local readf64 = buffer.readf64
+	local readstring = buffer.readstring
+
+	-- Constant kinds (LuauBytecodeConstantType)
+	local K_NIL, K_BOOLEAN, K_NUMBER, K_STRING, K_IMPORT, K_TABLE, K_CLOSURE, K_VECTOR = 0, 1, 2, 3, 4, 5, 6, 7
+	local K_TABLE_CONSTANTS, K_INTEGER, K_CLASS_SHAPE, K_VECTORD = 8, 9, 10, 11
+
+	-- Builds a 64-bit integer constant from its 7-bit varint groups.
+	-- Exists because integer values can only be made through the host integer library; wrapping arithmetic
+	-- reproduces the two's complement bit pattern of the magnitude.
+	-- @param groups { number } – 7-bit groups, least significant first
+	-- @param negative boolean – sign flag stored next to the magnitude
+	local function MakeInteger(groups: { number }, negative: boolean): any
+		local lib = (_G :: any).integer
+		assert(lib, "64-bit integer constants require the integer library")
+		local radix = lib.create(128)
+		local value = lib.create(0)
+		for i = #groups, 1, -1 do
+			value = lib.add(lib.mul(value, radix), lib.create(groups[i]))
+		end
+		return if negative then lib.neg(value) else value
+	end
+
+	-- Deserializes a bytecode blob into protos.
+	-- @param input string | buffer – bytecode as produced by luau-compile or luau_compile
+	-- @param vectorCtor (number, number, number, number) -> any – builds vector constants
+	local function Deserialize(input: string | buffer, vectorCtor: (number, number, number, number) -> any): Chunk
+		local stream = if type(input) == "string" then buffer.fromstring(input) else input :: buffer
+		local size = buffer.len(stream)
+		local cursor = 0
+
+		local function u8(): number
+			local v = readu8(stream, cursor)
+			cursor += 1
+			return v
+		end
+
+		local function u32(): number
+			local v = readu32(stream, cursor)
+			cursor += 4
+			return v
+		end
+
+		local function f64(): number
+			local v = readf64(stream, cursor)
+			cursor += 8
+			return v
+		end
+
+		local function f32(): number
+			local v = readf32(stream, cursor)
+			cursor += 4
+			return v
+		end
+
+		local function varint(): number
+			local result, scale = 0, 1
+			repeat
+				local b = u8()
+				result += (b % 128) * scale
+				scale *= 128
+			until b < 128
+			return result
+		end
+
+		local version = u8()
+		if version == 0 then
+			error(readstring(stream, 1, size - 1), 0)
+		elseif (version < 3 or version > 14) and version ~= 100 then
+			error(`unsupported bytecode version {version}`, 0)
+		end
+		local typesVersion = if version >= 4 then u8() else 0
+
+		local strings: { string } = {}
+		for i = 1, varint() do
+			local len = varint()
+			strings[i] = readstring(stream, cursor, len)
+			cursor += len
+		end
+
+		-- userdata type names only feed the host's type remapping
+		if typesVersion == 3 then
+			while u8() ~= 0 do
+				varint()
+			end
+		end
+
+		local hasClasses = false
+
+		local protoCount = varint()
+		local protos: { Proto } = table.create(protoCount)
+
+		for index = 1, protoCount do
+			local protoSize = if version >= 12 then varint() else 0
+			local protoStart = cursor
+
+			local maxStack, params, upvalues = u8(), u8(), u8()
+			local isVararg = u8() ~= 0
+			local flags = 0
+			if version >= 4 then
+				flags = u8()
+				cursor += varint() -- type info
+			end
+
+			local codeSize = varint()
+			local code = table.create(codeSize)
+			for i = 1, codeSize do
+				code[i] = u32()
+			end
+
+			local constCount = varint()
+			local constants: { any } = table.create(constCount)
+			local imports: { [number]: number } = {}
+			local closures: { [number]: number } = {}
+			local templates: { [number]: { number } } = {}
+
+			for k = 1, constCount do
+				local kind = u8()
+				if kind == K_NIL then
+					-- stays nil
+				elseif kind == K_BOOLEAN then
+					constants[k] = u8() ~= 0
+				elseif kind == K_NUMBER then
+					constants[k] = f64()
+				elseif kind == K_STRING then
+					constants[k] = strings[varint()]
+				elseif kind == K_IMPORT then
+					imports[k] = u32()
+				elseif kind == K_TABLE or kind == K_TABLE_CONSTANTS then
+					local fields = {}
+					for i = 1, varint() do
+						fields[i * 2 - 1] = varint()
+						if kind == K_TABLE then
+							fields[i * 2] = -1
+						else
+							local ki = u32()
+							fields[i * 2] = if ki >= 0x80000000 then ki - 0x100000000 else ki
+						end
+					end
+					templates[k] = fields
+				elseif kind == K_CLOSURE then
+					closures[k] = varint() + 1
+				elseif kind == K_VECTOR then
+					local x, y, z, w = f32(), f32(), f32(), f32()
+					constants[k] = vectorCtor(x, y, z, w)
+				elseif kind == K_VECTORD then
+					local x, y, z, w = f64(), f64(), f64(), f64()
+					constants[k] = vectorCtor(x, y, z, w)
+				elseif kind == K_INTEGER then
+					local negative = u8() ~= 0
+					local groups = {}
+					repeat
+						local b = u8()
+						table.insert(groups, b % 128)
+					until b < 128
+					constants[k] = MakeInteger(groups, negative)
+				elseif kind == K_CLASS_SHAPE then
+					-- the class is created once per load, as the host loader does; NEWCLASS hands out this value
+					local name = constants[varint() + 1]
+					local privateFields, privateMethods = u8(), u8()
+					local properties, methods = varint(), varint()
+					local fields, names = {}, {}
+					for i = 1, properties - privateFields do
+						fields[i] = constants[varint() + 1]
+					end
+					for i = 1, methods - privateMethods do
+						names[i] = constants[varint() + 1]
+					end
+					constants[k] = Classes.FromShape(name, fields, names, privateFields, privateMethods)
+					hasClasses = true
+				else
+					error(`unknown constant kind {kind}`, 0)
+				end
+			end
+
+			-- templates reference other constants by index, so they are built once every constant is known
+			for k, fields in templates do
+				local template = PresizedHash(#fields // 2)
+				local nilKeys = {}
+				for i = 1, #fields, 2 do
+					local key = constants[fields[i] + 1]
+					local vi = fields[i + 1]
+					local value = if vi >= 0 then constants[vi + 1] else nil
+					-- placeholder 0 mirrors the host loader: every field gets its node in order, nil constants last
+					template[key] = if value == nil then 0 else value
+					if vi >= 0 and value == nil then
+						table.insert(nilKeys, key)
+					end
+				end
+				for _, key in nilKeys do
+					template[key] = nil
+				end
+				constants[k] = template
+			end
+
+			local children = {}
+			for i = 1, varint() do
+				children[i] = varint() + 1
+			end
+
+			varint() -- line defined
+			local debugName = strings[varint()]
+
+			-- line info: per-instruction byte deltas on top of absolute lines sampled every 2^gapLog2 instructions
+			local lines: { number }? = nil
+			if u8() ~= 0 then
+				local gapLog2 = u8()
+				local intervals = (codeSize - 1) // 2 ^ gapLog2 + 1
+				local offsets = table.create(codeSize)
+				local last = 0
+				for i = 1, codeSize do
+					last = (last + u8()) % 256
+					offsets[i] = last
+				end
+				local absolute = table.create(intervals)
+				local line = 0
+				for i = 1, intervals do
+					line += buffer.readi32(stream, cursor)
+					cursor += 4
+					absolute[i] = line
+				end
+				lines = offsets
+				for i = 1, codeSize do
+					offsets[i] = absolute[(i - 1) // 2 ^ gapLog2 + 1] + offsets[i]
+				end
+			end
+
+			if u8() ~= 0 then -- debug info
+				for _ = 1, varint() do
+					varint()
+					varint()
+					varint()
+					u8()
+				end
+				for _ = 1, varint() do
+					varint()
+				end
+			end
+
+			-- feedback slots: call targets (unused here) and CONSTRUCT shapes (constant index of the table template)
+			local shapes: { [number]: number } = {}
+			if version >= 11 then
+				for slot = 0, varint() - 1 do
+					local kind = u8()
+					local value = varint()
+					if kind == 1 then
+						shapes[slot] = value + 1
+					end
+				end
+			end
+
+			if version >= 12 then
+				cursor = protoStart + protoSize
+			end
+
+			protos[index] = {
+				MaxStack = maxStack,
+				Params = params,
+				Upvalues = upvalues,
+				IsVararg = isVararg,
+				Flags = flags,
+				Code = code,
+				Constants = constants,
+				Imports = imports,
+				Closures = closures,
+				Children = children,
+				Name = debugName,
+				Lines = lines,
+				Shapes = shapes,
+			}
+		end
+
+		local main = varint() + 1
+		if cursor ~= size then
+			error("malformed bytecode: trailing data", 0)
+		end
+
+		return { Protos = protos, Main = main, HasClasses = hasClasses }
+	end
+
+	return Deserialize
 end)()
 
 -- init.luau

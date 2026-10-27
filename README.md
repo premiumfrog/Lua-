@@ -159,6 +159,8 @@ test names).
 
 * `tools/embed.py` compiles sources and embeds them as Luau modules for the drivers.
 * `tools/gen_fused.py` regenerates `src/Ops/Fused.luau`.
-* `tools/bundle.py` regenerates `bundled/Interpreter.luau` (`--check` verifies it is current).
+* `tools/bundle.py` regenerates `bundled/Interpreter.luau` from `src/`. It works from any directory, finds the
+  modules and their order from the requires, and takes `--github [REF]` to download the source from GitHub first
+  (`--repo`, `GITHUB_TOKEN` for private repositories), `--src`/`--out` for other paths, and `--check` for CI.
 * `tools/bench.luau` is the benchmark driver.
 * `tools/conformance.py` and `tools/conformance.luau` run one test suite; `tests/run.py` runs all of them.
