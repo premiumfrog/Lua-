@@ -11,8 +11,8 @@ local Interpreter = require(path.to.Interpreter) -- src/ as a folder of modules,
 local main = Interpreter.Load(bytecode, getfenv(), {
 	SafeEnv = true, -- resolve imports such as math.floor once, at load time (default)
 	ChunkName = "[string \"MyChunk\"]", -- error()/assert() and method-call errors get "MyChunk:line:" positions
-	DynamicEnv = false, -- per-closure environments with getfenv/setfenv (default off)
-	Debug = false, -- host-exact error positions and garbage collection timing (default off)
+	DynamicEnv = nil, -- per-closure environments with getfenv/setfenv (default: on when the chunk uses them)
+	Debug = false, -- positions on every error leaving a guest function, exact collection timing (default off)
 })
 print(main(...))
 ```
@@ -23,8 +23,8 @@ print(main(...))
 | --- | --- | --- |
 | `SafeEnv` | `true` | Imports such as `math.floor` resolve once at load. Turn it off when globals are replaced after loading. |
 | `ChunkName` | none | Prefix for guest error positions (`name:line:`). |
-| `DynamicEnv` | `false` | Every closure carries its own environment. Guest code gets `getfenv`/`setfenv` with the host's semantics: numeric levels, function targets, level 0 as the thread's globals, the host's error messages, and imports re-resolving once an environment has been exposed. Pass `true`, or a state from `Interpreter.NewEnvState()` to share one between chunks. |
-| `Debug` | `false` | Errors the host raises inside handlers ("attempt to call a nil value", arithmetic on nil) get the guest position, and no handler keeps a value alive after the guest stops referencing it, so weak tables clear exactly as they do natively. It returns to a trampoline after every instruction and tracks the current instruction, which makes the benchmark workloads 1.6 to 1.9 times slower. |
+| `DynamicEnv` | automatic | Every closure carries its own environment. Guest code gets `getfenv`/`setfenv` with the host's semantics: numeric levels, function targets, level 0 as the thread's globals, the host's error messages, and imports re-resolving once an environment has been exposed. It turns on by itself when the chunk names `getfenv` or `setfenv`. Pass `false` to keep it off, `true` to force it, or a state from `Interpreter.NewEnvState()` to share one between chunks. |
+| `Debug` | `false` | Every error leaving a guest function gets its guest position, including errors a host callback (an event connection, a scheduler) catches, and no handler keeps a value alive after the guest stops referencing it, so weak tables clear exactly as they do natively. It returns to a trampoline after every instruction and tracks the current instruction, which makes the benchmark workloads 1.6 to 1.9 times slower. |
 
 `bytecode` is the output of `luau-compile --binary` or `luau_compile`, as a string or a buffer. Line positions need
 line info, so compile with `-g1`. `Interpreter.Deserialize` exposes the parser for tooling.
@@ -47,7 +47,8 @@ The interpreter ships in two equivalent forms:
 | `Compiler` | Maps every planned instruction to its handler maker, back to front |
 | `Runtime` | Frame pools, the function trampoline, the return protocol and upvalue cells |
 | `Classes` | Luau classes: class values, instances, inheritance, private members and the `class` library |
-| `Env` | `DynamicEnv` state: VM-aware `getfenv`/`setfenv`, stack levels, `Debug` error repositioning |
+| `Env` | `DynamicEnv` state (VM-aware `getfenv`/`setfenv`) and the guest view of the host stack: handler registry, guest frames, error repositioning |
+| `Builtins` | Stack-aware replacements guest code sees: `pcall`, `xpcall`, coroutine and `task` bodies, `debug.info`, `debug.traceback` |
 | `Ops/*` | Handler makers grouped by kind: values, arithmetic, tables, calls, branches, loops, closures |
 | `Ops/Fused` | Generated handlers for hot instruction pairs (`tools/gen_fused.py`) |
 
@@ -123,36 +124,55 @@ python3 tests/run.py luau/luau luau/luau-compile --luau-source luau
   environment `tests/Conformance.test.cpp` gives each test: its own thread with fresh writable globals, `loadstring`
   bound to the thread's globals, and `limitedstack` set (interpreted calls keep their frames on the heap, so deep
   recursion stress runs out of memory rather than stack, like the ASAN and debug builds the flag exists for). Tests
-  using `getfenv`/`setfenv` load with `DynamicEnv`, and `classes` is compiled and run with the class fast flags
+  using `getfenv`/`setfenv` turn on `DynamicEnv` by themselves, and `classes` is compiled and run with the class fast flags
   `Conformance.test.cpp` sets. All 38 tests that run natively under the CLI pass at every level with `Debug`. In the
-  fast configuration, `tmerror` (positions on host-raised errors) and `closure` (weak-table collection timing) are
-  not run, and the other 36 pass.
+  fast configuration, `closure` (weak-table collection timing) is not run, and the other 37 pass.
 * **Skipped conformance tests.** 18 tests fail natively under the CLI because they need the C++ test host: native
   code generation, userdata and light userdata constructors, coverage and debugger hooks, `collectgarbage` options,
   or running on the main thread. `jit_inliner` needs a compiler flag for the native inliner.
 * **Interpreter tests.** `tests/unit` covers what the interpreter rewrites: environments, error positions, collection
-  timing, coroutines, metamethods and host callbacks, control flow, calls and varargs, globals and values. Each test
+  timing, the guest view of the stack (`stack`), coroutines, metamethods and host callbacks, control flow, calls and varargs, globals and values. Each test
   must pass natively too, so it only checks real Luau behavior. A `-- interpreter: debug-only` line limits a test to
   `Debug`, and `-- interpreter: unsafe-env` loads it with `SafeEnv` off.
 
 `tools/conformance.py` runs one suite at one level (`--mode fast|debug`, `--build src|bundled`, `--dir`, `--strict`,
 test names).
 
+## Guest view of the stack
+
+On the host stack a guest function is an interpreter closure running handlers. Every handler is registered with its
+instruction and the closures factories make are recognisable by their definition site, so walking the host stack with
+`debug.info` recovers the guest frames and the instruction each is running. Nothing is tracked while code runs; the
+walk happens only when guest code catches an error or inspects the stack:
+
+* **Error positions.** `pcall`, `xpcall`, coroutine bodies (`coroutine.create`/`wrap`, Roblox's `task.spawn`/`defer`/
+  `delay`) and the main function catch with an xpcall handler, which runs while the faulting handler is still on the
+  stack and rewrites an interpreter position ("Interpreter:812: attempt to index nil with 'x'") to the guest line.
+  Coroutines pay this once when they start, not per resume.
+* **`error(message, level)`** at level 2 and above gets the position of that guest-visible level.
+* **`debug.info(level, ...)`** and **`debug.traceback`** count and describe guest frames (source, current line,
+  name, function, arity) in the host's format, for the running thread and for other coroutines.
+
+These are swapped in where guest code reads the builtins, at load for imports and per read for other globals.
+
 ## Limitations
 
-* Without `DynamicEnv`, `getfenv`/`setfenv` on interpreted functions do not affect the environment they captured at
-  load.
-* Without `Debug`, errors raised by the host inside handlers, such as arithmetic on nil or calling a nil value, carry
-  the handler's position rather than the guest line. Guest `error()` (level 1), `assert()` and missing methods are
-  positioned in both modes when a `ChunkName` is given.
-* `error(message, 2)` and higher levels raise the message without a position.
+* An error that escapes a guest function into a host callback the interpreter does not wrap (an event connection,
+  `table.sort`'s comparator, a metamethod the host calls) keeps the interpreter position unless `Debug` is on, since
+  no guest catch point sees it.
+* Guest calls nest two host frames each (the function and the handler that called it), so the host's call depth
+  limit (about 20000 frames) allows about 10000 guest levels, or about 3300 with `Debug`.
+* A function that is returning a call (`return f(x)`) has handed control to its factory, so while the call runs it
+  appears in `debug.info`/`debug.traceback` without a source line. `debug.info(f, ...)` on an interpreted function
+  value describes the interpreter's closure; levels describe the guest.
+* A stack overflow inside nested guest `pcall`s may report "error in error handling" (the host leaves no room to call
+  the repositioning handler).
 * Class values and instances are tables behind protected metatables, because Luau code cannot create new value
   types. In class chunks, `type`, `typeof` and `getmetatable` are swapped for class-aware versions and `class` is
   the interpreter's own library, so guest code sees `"class"`/`"object"` and the host's error messages. Raw access
   (`rawget`, `next`) and the default `tostring` address differ from the host's.
-* With `SafeEnv` (the default), imports that resolve at load time are fixed. Turn `SafeEnv` off when globals are
-  replaced after loading.
-* `debug.info` and `debug.traceback` describe the interpreter's frames, not the guest's.
+* With `SafeEnv` (the default) imports resolve once at load, as the host does for a safe environment. Turn it off
+  when guest globals such as `math` are replaced after loading.
 * Each proto keeps up to 17 frames for reuse, which can hold stale register values until they are reused.
 
 ## Tools

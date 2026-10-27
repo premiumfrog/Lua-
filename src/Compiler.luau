@@ -22,6 +22,7 @@ local Env = require("./Env")
 local Fused = require("./Ops/Fused")
 local Objects = require("./Ops/Objects")
 local Classes = require("./Classes")
+local Builtins = require("./Builtins")
 
 type Proto = Types.Proto
 type Chunk = Types.Chunk
@@ -99,14 +100,18 @@ local function ResolveCells(chunk: Chunk): { { boolean } }
 	return cells
 end
 
--- Wraps error() so a message raised at level 1 carries the guest call site, not the handler's.
--- Higher levels name host frames the guest cannot see, so those messages stay bare.
+-- Wraps error() so a message carries the guest position of its level: the call site for level 1, and the
+-- guest-visible stack level (found by walking the host stack) for higher levels.
 -- @param where string – "chunk:line: " prefix of the call site
 local function GuestError(where: string): (...any) -> ()
 	return function(message: any, level: any)
 		local kind = type(message)
-		if (kind == "string" or kind == "number") and (level == nil or level == 1) then
-			error(where .. message, 0)
+		if kind == "string" or kind == "number" then
+			if level == nil or level == 1 then
+				error(where .. message, 0)
+			elseif type(level) == "number" and level >= 2 then
+				error(Builtins.LevelWhere(level) .. message, 0)
+			end
 		end
 		error(message, 0)
 	end
@@ -181,22 +186,30 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 	local dyn = ctx.Dyn
 	local safe = ctx.SafeEnv and dyn == nil
 
-	-- class chunks: `class` is the interpreter's library, and type/typeof/getmetatable resolve to class-aware versions
+	-- Replacement of a host value guest code reads: stack-aware builtins, and class-aware ones in class chunks.
+	local function Swapped(value: any): any
+		if value == nil then
+			return nil
+		elseif ctx.Classes and Classes.Swaps[value] ~= nil then
+			return Classes.Swaps[value]
+		end
+		local swap = (if ctx.Debug then Builtins.DebugSwaps else Builtins.Swaps)[value]
+		return if swap ~= nil then swap else value
+	end
+
+	-- Imports resolved at load. In class chunks `class` is the interpreter's library, whatever SafeEnv says.
 	local ClassRoot = { class = Classes.Library }
-	local function ResolveClassImport(path: { any }): any
-		if path[1] == "class" then
+	local function ResolveImportSwapped(path: { any }): any
+		if ctx.Classes and path[1] == "class" then
 			return Analysis.ResolveImport(ClassRoot, path)
 		elseif not safe then
 			return nil
 		end
-		local value = Analysis.ResolveImport(env, path)
-		if value ~= nil and Classes.Swaps[value] ~= nil then
-			value = Classes.Swaps[value]
-		end
-		return value
+		return Swapped(Analysis.ResolveImport(env, path))
 	end
 
-	local prog = Analysis.Analyze(proto, cells, env, safe, ctx.Debug, if ctx.Classes then ResolveClassImport else nil)
+	local prog = Analysis.Analyze(proto, cells, env, safe, ctx.Debug, ResolveImportSwapped)
+	local site: Env.Site = { Name = ctx.ChunkName, Proto = proto }
 
 	local OpOf, OA, OB, OC, OD, Aux, Len = prog.Op, prog.A, prog.B, prog.C, prog.D, prog.Aux, prog.Len
 	local base = prog.Base
@@ -217,11 +230,19 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		return ""
 	end
 
-	-- Values swapped when guest code reads them: VM-aware getfenv/setfenv, positioned error/assert wrappers.
-	local function Swaps(pc: number): { [any]: any }?
+	-- Values swapped when guest code reads them: VM-aware getfenv/setfenv, positioned error/assert wrappers, and
+	-- stack-aware builtins when the global's name is one of theirs.
+	-- @param name string? – global name (or import root) read at pc
+	local function Swaps(pc: number, name: string?): { [any]: any }?
 		local swaps: { [any]: any }? = nil
 		if dyn then
 			swaps = { [Env.HostGetfenv] = dyn.getfenv, [Env.HostSetfenv] = dyn.setfenv }
+		end
+		if name and Builtins.Names[name] then
+			swaps = swaps or {}
+			for host, replacement in if ctx.Debug then Builtins.DebugSwaps else Builtins.Swaps do
+				(swaps :: any)[host] = replacement
+			end
 		end
 		if ctx.Classes then
 			swaps = swaps or {}
@@ -526,10 +547,10 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		elseif op == Op.GETGLOBAL and ctx.Classes and K[Aux[pc] + 1] == "class" then
 			return Values.LoadK(A, Classes.Library, nextH, chain)
 		elseif op == Op.GETGLOBAL and dyn then
-			return Values.GetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], Swaps(pc), nextH, chain)
+			return Values.GetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], Swaps(pc, K[Aux[pc] + 1]), nextH, chain)
 		elseif op == Op.GETGLOBAL then
 			-- the global may be replaced at any time, so swaps (positioned error/assert, class builtins) happen per read
-			local swaps = Swaps(pc)
+			local swaps = Swaps(pc, K[Aux[pc] + 1])
 			if swaps then
 				return Values.GetGlobalSwapped(A, env, K[Aux[pc] + 1], swaps, nextH, chain)
 			end
@@ -549,20 +570,17 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		elseif op == Op.CLOSEUPVALS then
 			return Values.CloseUpvals(A, nextH, chain)
 		elseif op == Op.GETIMPORT and ctx.Classes and Analysis.ImportPath(K, Aux[pc])[1] == "class" then
-			return Values.LoadK(A, ResolveClassImport(Analysis.ImportPath(K, Aux[pc])), nextH, chain)
+			return Values.LoadK(A, ResolveImportSwapped(Analysis.ImportPath(K, Aux[pc])), nextH, chain)
 		elseif op == Op.GETIMPORT and dyn then
 			local path = Analysis.ImportPath(K, Aux[pc])
 			local resolved = if ctx.SafeEnv and not dyn.Unsafe[env] then Analysis.ResolveImport(env, path) else nil
-			return Values.GetImportDyn(A, Env.ENV, path, resolved, env, dyn.Unsafe, Swaps(pc), nextH, chain)
+			return Values.GetImportDyn(A, Env.ENV, path, Swapped(resolved), env, dyn.Unsafe, Swaps(pc, path[1]), nextH, chain)
 		elseif op == Op.GETIMPORT then
 			local path = Analysis.ImportPath(K, Aux[pc])
 			if ctx.SafeEnv then
 				local value = prog.Imports[pc]
 				if value == nil then
-					value = Analysis.ResolveImport(env, path)
-				end
-				if ctx.Classes and value ~= nil and Classes.Swaps[value] ~= nil then
-					value = Classes.Swaps[value]
+					value = Swapped(Analysis.ResolveImport(env, path))
 				end
 				local site = prog.Positioned[pc]
 				local where = if site then Where(site) else ""
@@ -573,7 +591,7 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 					return Values.LoadK(A, value, nextH, chain)
 				end
 			end
-			local swaps = Swaps(pc)
+			local swaps = Swaps(pc, path[1])
 			if swaps then
 				return Values.GetImportSwapped(A, env, path, swaps, nextH, chain)
 			end
@@ -708,6 +726,7 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 	for i = #live, 1, -1 do
 		local pc = live[i]
 		local h = Build(pc)
+		Env.Register(h, site, pc)
 		local list = prog.Wrappers[pc]
 		if list then
 			for _, loop in list do
@@ -717,6 +736,7 @@ local function CompileProto(proto: Proto, index: number, ctx: Context): (Handler
 		if ctx.Debug then
 			h = Track(h, pc)
 		end
+		Env.Register(h, site, pc)
 		Top[pc] = h
 	end
 
@@ -779,13 +799,14 @@ function Compiler.Compile(chunk: Chunk, env: any, safeEnv: boolean, chunkName: s
 		local main = ctx.Factories[chunk.Main](U)
 		U[Env.FN] = main
 		dyn.Owners[main] = U
-		return main
+		return if ctx.Debug then main else Builtins.Main(main)
 	end
-	return ctx.Factories[chunk.Main]({})
+	local main = ctx.Factories[chunk.Main]({})
+	return if ctx.Debug then main else Builtins.Main(main)
 end
 
 -- interpreter frames are invisible to guest stack levels (getfenv/setfenv under DynamicEnv)
-for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler, Objects, Classes } do
+for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler, Objects, Classes, Builtins } do
 	for _, member in module :: any do
 		if type(member) == "function" then
 			Env.MarkInternal(member)
@@ -796,5 +817,12 @@ end
 Env.MarkInternal(ResolveCells)
 Env.MarkInternal(Env.Reposition)
 Env.MarkGuarded(Run)
+
+-- guest functions are the closures factories make; each variant has its own definition site
+local function Probe(_S: Frame): any
+	return nil
+end
+Env.MarkEntry(Runtime.Factory(Probe, 0, 0, false, {}, 0)({}))
+Env.MarkEntry(Runtime.Factory(Probe, 0, 0, true, {}, 0)({}))
 
 return Compiler

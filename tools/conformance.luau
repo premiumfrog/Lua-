@@ -61,8 +61,6 @@ if not okN or rN ~= "OK" then
 	return
 end
 
--- Tests touching environments run with DynamicEnv, the opt-in getfenv/setfenv support.
-local dynamic = string.find(w.Source, "fenv", 1, true) ~= nil
 -- Interpreted calls use heap frames, so memory-exhaustion stress runs out of memory, not stack: the test suite's
 -- limitedstack flag (set natively for ASAN/debug builds) covers exactly this.
 local guestEnv = Env()
@@ -71,7 +69,6 @@ local safeEnv = string.find(w.Source, "-- interpreter: unsafe-env", 1, true) == 
 local okL, f = pcall(Interpreter.Load, w.Bytecode, guestEnv, {
 	ChunkName = chunkName,
 	SafeEnv = safeEnv,
-	DynamicEnv = dynamic,
 	Debug = mode == "debug",
 })
 if not okL then

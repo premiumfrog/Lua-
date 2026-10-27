@@ -1,5 +1,5 @@
--- interpreter: debug-only
--- Error positions for errors the host raises inside handlers (arithmetic, calls, indexing) match native.
+-- Error positions for errors the host raises inside handlers (arithmetic, calls, indexing) match native, in both
+-- modes: Debug tracks the running instruction, and otherwise pcall finds it on the stack.
 
 local function catch(f, ...)
 	local ok, err = pcall(f, ...)

@@ -33,6 +33,19 @@ local function DefaultVector(x: number, y: number, z: number, w: number): any
 	error("vector constants need the vector library or Vector3", 0)
 end
 
+-- Whether any function of a chunk names getfenv or setfenv (as a global, an import or a field).
+-- Why: DynamicEnv turns itself on for such chunks, as the host deoptimizes environments for them.
+local function UsesFenv(chunk: Types.Chunk): boolean
+	for _, proto in chunk.Protos do
+		for _, k in proto.Constants do
+			if k == "getfenv" or k == "setfenv" then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 -- Loads bytecode and returns its main function.
 -- @param bytecode string | buffer – serialized Luau bytecode (luau-compile --binary / luau_compile)
 -- @param env table? – globals for the chunk; defaults to the caller-independent shared _G
@@ -42,7 +55,7 @@ function Interpreter.Load(bytecode: string | buffer, env: { [any]: any }?, optio
 	local chunk = Deserialize(bytecode, opts.Vector or DefaultVector)
 	local globals = env or _G
 	local dyn: Env.State? = nil
-	if opts.DynamicEnv == true then
+	if opts.DynamicEnv == true or (opts.DynamicEnv == nil and UsesFenv(chunk)) then
 		dyn = Env.New()
 	elseif opts.DynamicEnv then
 		dyn = opts.DynamicEnv :: any

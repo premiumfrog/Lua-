@@ -19,9 +19,9 @@ ROOT = os.path.dirname(HERE)
 # Luau's conformance suite: a Luau source checkout at $LUAU_SOURCE, or ./luau
 TESTS = os.path.join(os.environ.get("LUAU_SOURCE", os.path.join(ROOT, "luau")), "tests", "conformance")
 
-# Tests that observe what only Debug mode reproduces: positions on host-raised errors (tmerror) and collection of
-# values the guest no longer references while chained handlers are still running (closure). Not run in fast mode.
-NEEDS_DEBUG = {"closure", "tmerror"}
+# Tests that observe what only Debug mode reproduces: collection of values the guest no longer references while
+# chained handlers are still running (closure). Not run in fast mode.
+NEEDS_DEBUG = {"closure"}
 
 # Tests for features behind fast flags, as tests/Conformance.test.cpp enables them; passed to compiler and runtime.
 FFLAGS = {

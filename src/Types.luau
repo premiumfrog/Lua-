@@ -38,7 +38,7 @@ export type Options = {
 	Vector: ((number, number, number, number) -> any)?, -- vector constant constructor
 	SafeEnv: boolean?, -- resolve imports once at load (default true)
 	ChunkName: string?, -- position prefix for errors raised by guest error()/assert() and method calls
-	DynamicEnv: (boolean | any)?, -- per-closure environments with getfenv/setfenv; true or a state from NewEnvState
+	DynamicEnv: (boolean | any)?, -- per-closure environments with getfenv/setfenv; true, false, or a state from NewEnvState (default: on when the chunk names getfenv/setfenv)
 	Debug: boolean?, -- position host-raised errors (arithmetic on nil, calling nil) at the guest line; slower
 }
 

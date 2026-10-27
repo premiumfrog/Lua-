@@ -45,7 +45,7 @@ export type Options = {
 	Vector: ((number, number, number, number) -> any)?, -- vector constant constructor
 	SafeEnv: boolean?, -- resolve imports once at load (default true)
 	ChunkName: string?, -- position prefix for errors raised by guest error()/assert() and method calls
-	DynamicEnv: (boolean | any)?, -- per-closure environments with getfenv/setfenv; true or a state from NewEnvState
+	DynamicEnv: (boolean | any)?, -- per-closure environments with getfenv/setfenv; true, false, or a state from NewEnvState (default: on when the chunk names getfenv/setfenv)
 	Debug: boolean?, -- position host-raised errors (arithmetic on nil, calling nil) at the guest line; slower
 }
 
@@ -110,6 +110,30 @@ export type Program = {
 	Base: number, -- frame index of register 0
 }
 
+export type EnvState = {
+	Unsafe: { [any]: boolean }, -- environments exposed through getfenv/setfenv; their imports resolve per access
+	Owners: { [any]: { any } }, -- VM closure -> its upvalue table
+	getfenv: (any?) -> any,
+	setfenv: (any, any) -> any,
+}
+
+export type Site = {
+	Name: string?, -- chunk name used as the source of positions
+	Proto: Proto,
+}
+
+export type StackFrame = {
+	Fn: any,
+	Site: Site?,
+	Pc: number?,
+	Source: string?,
+	Line: number?,
+	Name: string?,
+	Params: number?,
+	Vararg: boolean?,
+	C: boolean,
+}
+
 export type Class = {
 	Name: string,
 	Id: number,
@@ -127,13 +151,6 @@ export type Class = {
 	InstanceMeta: { [string]: any }?, -- user metamethods, inherited by subclasses
 	ObjectMeta: { [any]: any }, -- metatable of instances
 	Proxy: { [any]: any }, -- the guest-visible class value
-}
-
-export type EnvState = {
-	Unsafe: { [any]: boolean }, -- environments exposed through getfenv/setfenv; their imports resolve per access
-	Owners: { [any]: { any } }, -- VM closure -> its upvalue table
-	getfenv: (any?) -> any,
-	setfenv: (any, any) -> any,
 }
 
 -- Runtime.luau
@@ -1480,6 +1497,607 @@ local Module_Analysis = (function()
 	return Analysis
 end)()
 
+-- Env.luau
+local Module_Env = (function()
+	-- Dynamic environments and the guest view of the host stack.
+	--
+	-- getfenv/setfenv with the host's semantics, enabled by the DynamicEnv load option.
+	-- Why: by default globals bind to one environment at load time, which is fastest; code that swaps environments
+	-- needs every closure to carry its own environment and imports to re-resolve once an environment is exposed.
+	--
+	-- Each VM closure's upvalue table holds its environment under ENV and the closure itself under FN. Numeric levels
+	-- walk the host call stack: VM closures are real host functions there, interpreter internals are skipped, and
+	-- other functions (pcall, host callbacks) count as levels, as they do on the host.
+	--
+	-- Stack view: every handler is registered with its instruction, and factory closures (the guest functions) are
+	-- recognisable by their definition site, so a host stack walk recovers the guest frames and the instruction each is
+	-- running. Errors, error levels, debug.info and debug.traceback use it to report guest positions without any
+	-- per-instruction tracking: the walk only happens when one of them asks.
+
+
+
+
+	local hostGetfenv = getfenv
+	local hostSetfenv = setfenv
+	local info = debug.info
+
+	-- Upvalue-table keys of a closure's environment and of the closure itself
+	local ENV, FN = "\0env", "\0fn"
+
+	-- Sources of interpreter modules; their frames are invisible to guest levels
+	local internal: { [string]: boolean } = {}
+	-- Interpreter functions run through a host pcall; that pcall's frame is invisible too
+	local guarded: { [any]: boolean } = {}
+	-- Interpreter wrappers that call guest code through a host xpcall; that xpcall's frame is invisible too
+	local wrappers: { [any]: boolean } = {}
+
+	-- Proto-wide position data shared by its handlers
+
+	-- A guest-visible stack level: a guest function (Site and Pc of its running instruction) or a host function
+
+	-- Handler closure -> its instruction and its proto's site
+	local Pcs: { [any]: number } = setmetatable({}, { __mode = "k" }) :: any
+	local Sites: { [any]: Site } = setmetatable({}, { __mode = "k" }) :: any
+	-- Definition site of the factory closures that run guest functions
+	local entrySource: string? = nil
+	local entryLines: { [number]: boolean } = {}
+
+	local Env = {}
+
+	Env.ENV = ENV
+	Env.FN = FN
+	Env.HostGetfenv = hostGetfenv
+	Env.HostSetfenv = hostSetfenv
+
+	-- Marks the module defining a function as interpreter-internal.
+	-- @param fn function – any function defined in that module
+	function Env.MarkInternal(fn: (...any) -> ...any)
+		internal[info(fn, "s")] = true
+	end
+
+	-- Marks an interpreter function the interpreter itself calls through pcall (Debug mode).
+	-- @param fn function – function passed to pcall
+	function Env.MarkGuarded(fn: (...any) -> ...any)
+		guarded[fn] = true
+	end
+
+	-- Marks an interpreter wrapper that runs guest code through xpcall (its xpcall frame is not a guest level).
+	-- @param fn function – the wrapper
+	function Env.MarkWrapper(fn: (...any) -> ...any)
+		wrappers[fn] = true
+	end
+
+	-- Records the definition site of a guest-function closure made by the runtime.
+	-- @param fn function – a closure returned by a factory
+	function Env.MarkEntry(fn: (...any) -> ...any)
+		local source, line = info(fn, "sl")
+		entrySource = source
+		entryLines[line] = true
+	end
+
+	-- Registers a handler so stack walks can map its frame to a guest instruction.
+	-- @param h function – handler closure
+	-- @param site Site – its proto's site
+	-- @param pc number – its instruction
+	function Env.Register(h: any, site: Site, pc: number)
+		Pcs[h] = pc
+		Sites[h] = site
+	end
+
+	-- Whether a function is a guest function made by the runtime.
+	local function IsEntry(fn: any): boolean
+		local source, line = info(fn, "sl")
+		return source == entrySource and entryLines[line] == true
+	end
+	Env.IsEntry = IsEntry
+
+	-- Source line of an instruction, or -1 without line info.
+	local function LineOf(site: Site, pc: number): number
+		local lines = site.Proto.Lines
+		return if lines and lines[pc] then lines[pc] else -1
+	end
+	Env.LineOf = LineOf
+
+	-- "chunk:line: " of an instruction, or "" without a chunk name or line info.
+	local function SiteWhere(site: Site, pc: number): string
+		local line = LineOf(site, pc)
+		if site.Name and line > 0 then
+			return `{site.Name}:{line}: `
+		end
+		return ""
+	end
+
+	-- Whether the frame at a level of the caller's stack is the host xpcall of an interpreter wrapper.
+	local function WrapperCall(thread: thread?, i: number, source: string): boolean
+		if source ~= "[C]" then
+			return false
+		end
+		-- on the running thread, levels here are one deeper than the caller's
+		local outer = if thread then info(thread, i + 1, "f") else info(i + 2, "f")
+		return outer ~= nil and wrappers[outer] == true
+	end
+
+	-- Guest-visible frames of a stack, innermost first: guest functions with their running instruction, and host
+	-- functions as the host reports them. Interpreter frames are left out.
+	-- @param thread thread? – another coroutine, or nil for the running one
+	-- @param from number – first host level to inspect (1 is the walker itself on the running thread)
+	function Env.Frames(thread: thread?, from: number): { StackFrame }
+		local frames: { StackFrame } = {}
+		local site: Site?, pc: number? = nil, nil
+		local i = from
+		local skip = false
+		while true do
+			local fn = if thread then info(thread, i, "f") else info(i, "f")
+			if fn == nil then
+				break
+			end
+			if skip then
+				skip = false
+			elseif guarded[fn] then
+				skip = true
+			elseif Pcs[fn] ~= nil then
+				-- handlers nest inside their function's frame; the innermost one is the running instruction
+				if pc == nil then
+					pc, site = Pcs[fn], Sites[fn]
+				end
+			elseif IsEntry(fn) then
+				table.insert(frames, { Fn = fn, Site = site, Pc = pc, C = false })
+				site, pc = nil, nil
+			else
+				local source = info(fn, "s")
+				if not internal[source] and not WrapperCall(thread, i, source) then
+					local src, line, name, params, vararg
+					if thread then
+						src, line, name, params, vararg = info(thread, i, "slna")
+					else
+						src, line, name, params, vararg = info(i, "slna")
+					end
+					table.insert(frames, {
+						Fn = fn, Source = src, Line = line, Name = name, Params = params, Vararg = vararg, C = src == "[C]",
+					})
+				end
+			end
+			i += 1
+		end
+		return frames
+	end
+
+	-- "source:line: " of a stack frame, as luaL_where reports it ("" for C functions and unknown lines).
+	function Env.Where(frame: StackFrame): string
+		local site = frame.Site
+		if site then
+			return SiteWhere(site, frame.Pc :: number)
+		elseif frame.C or frame.Source == nil or (frame.Line :: number) <= 0 then
+			return ""
+		end
+		return `{frame.Source}:{frame.Line}: `
+	end
+
+	-- Position of the innermost guest instruction on a stack.
+	-- @param thread thread? – another coroutine, or nil for the running one
+	function Env.Current(thread: thread?): string
+		local i = if thread then 0 else 1
+		while true do
+			local fn = if thread then info(thread, i, "f") else info(i, "f")
+			if fn == nil then
+				return ""
+			end
+			local pc = Pcs[fn]
+			if pc then
+				return SiteWhere(Sites[fn], pc)
+			end
+			i += 1
+		end
+	end
+
+	-- Replaces the position an interpreter module put on an error message with the guest's.
+	-- Why: Debug mode reports host-raised errors (calling nil, arithmetic on nil) at the guest line, as the host VM does.
+	-- @param message any – caught error value; non-strings and guest-positioned messages pass through
+	-- @param where string – guest "chunk:line: " prefix, or "" to drop the internal one
+	function Env.Reposition(message: any, where: string): any
+		if type(message) ~= "string" then
+			return message
+		end
+		local src, rest = string.match(message, "^(.-):%d+: (.*)$")
+		if src and internal[src] then
+			return where .. rest
+		end
+		return message
+	end
+
+	-- Error handler giving an error raised inside a handler the position of the guest instruction, found on the stack.
+	-- Why: without Debug nothing tracks the running instruction, but at the moment of the error the handler is still on
+	-- the stack, so catch points (pcall, xpcall, resume, the main function) can recover it.
+	-- @param message any – error value; only strings an interpreter module positioned change
+	-- @param thread thread? – the coroutine that raised it, when it is not the running one
+	function Env.Relocate(message: any, thread: thread?): any
+		if type(message) ~= "string" then
+			return message
+		end
+		local src = string.match(message, "^(.-):%d+: ")
+		if src and internal[src] then
+			return Env.Reposition(message, Env.Current(thread))
+		end
+		return message
+	end
+
+	-- Function at a guest-visible stack level (1 = the function calling getfenv/setfenv); nil past the stack.
+	-- @param owners { [any]: any } – VM closures (defined in an internal module, yet guest-visible)
+	local function AtLevel(owners: { [any]: any }, level: number): any
+		local seen = 0
+		local i = 2 -- 1 is AtLevel's caller in this module
+		local skip = false
+		while true do
+			local fn = info(i, "f")
+			if fn == nil then
+				return nil
+			end
+			local source = info(i, "s")
+			if skip then
+				skip = false
+			elseif guarded[fn] then
+				skip = true
+			elseif owners[fn] ~= nil or not (internal[source] or WrapperCall(nil, i, source)) then
+				seen += 1
+				if seen == level then
+					return fn
+				end
+			end
+			i += 1
+		end
+	end
+
+	-- Creates a dynamic environment state. Level 0 is the running thread's globals, as on the host.
+	function Env.New(): EnvState
+		local state: EnvState
+		state = {
+			Unsafe = setmetatable({}, { __mode = "k" }) :: any,
+			Owners = setmetatable({}, { __mode = "k" }) :: any,
+			getfenv = nil :: any,
+			setfenv = nil :: any,
+		}
+
+		-- Environment of a function: its upvalue table's for VM closures; the thread's globals for C functions (the
+		-- VM-aware getfenv/setfenv stand in for C functions); the host's otherwise.
+		local function EnvOf(fn: any): any
+			local U = state.Owners[fn]
+			if U then
+				return U[ENV]
+			end
+			local src = info(fn, "s")
+			if src == "[C]" or internal[src] then
+				return hostGetfenv(0)
+			end
+			return hostGetfenv(fn)
+		end
+
+		-- Function at a level argument, with the host's argument errors (raised without a position, as by C).
+		-- @param name string – "getfenv" or "setfenv", for messages
+		-- @param target any – level argument
+		local function Resolve(name: string, target: any): (number, any)
+			local level = tonumber(target)
+			if level == nil then
+				error(`invalid argument #1 to '{name}' (number expected, got {typeof(target)})`, 0)
+			end
+			level = if level >= 0 then math.floor(level) else math.ceil(level)
+			if level < 0 then
+				error(`invalid argument #1 to '{name}' (level must be non-negative)`, 0)
+			elseif level == 0 then
+				return 0, nil
+			end
+			local fn = AtLevel(state.Owners, level)
+			if fn == nil then
+				error(`invalid argument #1 to '{name}' (invalid level)`, 0)
+			end
+			return level, fn
+		end
+
+		-- getfenv for guest code.
+		-- @param target any – level (default 1) or function
+		state.getfenv = function(target: any?): any
+			local env
+			if type(target) == "function" then
+				env = EnvOf(target)
+			else
+				local level, fn = Resolve("getfenv", if target == nil then 1 else target)
+				env = if level == 0 then hostGetfenv(0) else EnvOf(fn)
+			end
+			if type(env) == "table" then
+				state.Unsafe[env] = true
+			end
+			return env
+		end
+
+		-- setfenv for guest code; returns the function whose environment changed, as the host does.
+		state.setfenv = function(target: any, env: any): any
+			if type(env) ~= "table" then
+				error(`invalid argument #2 to 'setfenv' (table expected, got {typeof(env)})`, 0)
+			end
+			local fn = target
+			if type(target) ~= "function" then
+				local level
+				level, fn = Resolve("setfenv", target)
+				if level == 0 then
+					state.Unsafe[env] = true
+					hostSetfenv(0, env)
+					return nil
+				end
+			end
+			state.Unsafe[env] = true
+			local U = state.Owners[fn]
+			if U then
+				U[ENV] = env
+				return fn
+			end
+			local src = info(fn, "s")
+			if src == "[C]" or internal[src] then
+				error("'setfenv' cannot change environment of given object", 0)
+			end
+			return hostSetfenv(fn, env)
+		end
+
+		return state
+	end
+
+	-- Swaps the host getfenv/setfenv for the state's versions when guest code reads them.
+	function Env.Swap(state: EnvState, value: any): any
+		if rawequal(value, hostGetfenv) then
+			return state.getfenv
+		elseif rawequal(value, hostSetfenv) then
+			return state.setfenv
+		end
+		return value
+	end
+
+	Env.MarkInternal(Env.Swap)
+
+	return Env
+end)()
+
+-- Builtins.luau
+local Module_Builtins = (function()
+	-- Guest-facing replacements for host builtins that observe the call stack: pcall, xpcall, coroutine.create,
+	-- coroutine.wrap, task.spawn/defer/delay (Roblox), debug.info and debug.traceback.
+	-- Why: on the host stack a guest function is an interpreter closure running handlers, so these builtins would report
+	-- interpreter positions and frames. The replacements walk the stack through Env, which maps handler frames back to
+	-- guest instructions, so guest code sees the positions, levels and tracebacks the host VM would give it. Nothing is
+	-- tracked while code runs: the work happens only when an error is caught or the stack is inspected.
+
+	local Env = Module_Env
+
+	local hostXpcall = xpcall
+	local hostDebug: any = debug
+	local hostCoroutine: any = coroutine
+	local hostInfo = debug.info
+	local hostTraceback = debug.traceback
+	local hostWrap = coroutine.wrap
+	local hostCreate = coroutine.create
+	local hostRunning = coroutine.running
+
+	local Relocate = Env.Relocate
+	local Frames, Where = Env.Frames, Env.Where
+
+	local Builtins = {}
+
+	-- Returns the results of a successful protected call, or raises its error unchanged.
+	local function Rethrow(ok: boolean, ...: any): ...any
+		if ok then
+			return ...
+		end
+		error((...), 0)
+	end
+
+	-- pcall whose caught errors carry the guest position of the instruction that raised them.
+	local function Pcall(f: any, ...: any): ...any
+		return hostXpcall(f, Relocate, ...)
+	end
+
+	-- xpcall whose handler receives guest-positioned errors; the handler still runs where the error was raised.
+	local function Xpcall(f: any, handler: any, ...: any): ...any
+		if type(handler) ~= "function" then
+			return hostXpcall(f, handler, ...) -- the host's own argument error
+		end
+		return hostXpcall(f, function(message: any): ...any
+			return handler(Relocate(message))
+		end, ...)
+	end
+
+	-- Wraps a function so errors escaping it carry guest positions: its xpcall handler runs while the faulting handler
+	-- is still on the stack. Used for the chunk's main function and for coroutine bodies, so a coroutine pays once when
+	-- it starts rather than on every resume.
+	-- @param f function – guest function
+	local function Guarded(f: (...any) -> ...any): (...any) -> ...any
+		local function Guard(...: any): ...any
+			return Rethrow(hostXpcall(f, Relocate, ...))
+		end
+		Env.MarkWrapper(Guard)
+		return Guard
+	end
+
+	-- coroutine.create, coroutine.wrap and Roblox's task.spawn/task.defer/task.delay with guarded bodies.
+	-- Non-function arguments go to the host unchanged, for its own errors (and for task's thread arguments).
+	local function Create(f: any): any
+		return hostCreate(if type(f) == "function" then Guarded(f) else f)
+	end
+	local function Wrap(f: any): any
+		return hostWrap(if type(f) == "function" then Guarded(f) else f)
+	end
+	local hostTask: any = task -- Roblox only; nil elsewhere
+	local Spawn, Defer, Delay
+	if type(hostTask) == "table" then
+		local spawn, defer, delay = hostTask.spawn, hostTask.defer, hostTask.delay
+		Spawn = function(f: any, ...: any): any
+			return spawn(if type(f) == "function" then Guarded(f) else f, ...)
+		end
+		Defer = function(f: any, ...: any): any
+			return defer(if type(f) == "function" then Guarded(f) else f, ...)
+		end
+		Delay = function(t: any, f: any, ...: any): any
+			return delay(t, if type(f) == "function" then Guarded(f) else f, ...)
+		end
+	end
+
+	-- Splits debug.info/debug.traceback arguments into thread (nil for the running one) and the rest.
+	local function ThreadArg(first: any): thread?
+		if type(first) == "thread" and first ~= hostRunning() then
+			return first
+		end
+		return nil
+	end
+
+	-- debug.traceback over guest frames, in the host's format ("source:line function name" per Luau frame).
+	local function Traceback(...: any): any
+		local first = ...
+		local isThread = type(first) == "thread"
+		local thread = ThreadArg(first)
+		local message, level
+		if isThread then
+			message, level = select(2, ...)
+		else
+			message, level = ...
+		end
+		local kind = type(message)
+		if (message ~= nil and kind ~= "string" and kind ~= "number") or (level ~= nil and type(level) ~= "number") then
+			return hostTraceback(...) -- the host's own argument errors
+		end
+		level = if level then math.floor(level) else if isThread then 0 else 1
+		if level < 0 then
+			return hostTraceback(...)
+		end
+		local lines = {}
+		if message ~= nil then
+			table.insert(lines, tostring(message) .. "\n")
+		end
+		-- the running thread's level 1 is the caller; another thread's level 0 is its innermost frame
+		local frames = Frames(thread, if thread then 0 else 1)
+		for i = if thread then level + 1 else level, #frames do
+			local frame = frames[i]
+			if frame.C then
+				continue
+			end
+			local source, line, name
+			local site = frame.Site
+			if site then
+				source, line, name = site.Name or "?", Env.LineOf(site, frame.Pc :: number), site.Proto.Name
+			else
+				source, line, name = frame.Source, frame.Line, frame.Name
+				name = if name == "" then nil else name
+			end
+			table.insert(lines, `{source}{if (line :: number) > 0 then ":" .. line else ""}{if name then " function " .. name else ""}\n`)
+		end
+		return table.concat(lines)
+	end
+
+	local OPTIONS = { s = true, l = true, n = true, f = true, a = true }
+
+	-- debug.info over guest frames: levels count guest functions, and a guest level reports its source, current line,
+	-- name, function and arity as the host would.
+	local function Info(...: any): ...any
+		local first = ...
+		local isThread = type(first) == "thread"
+		local thread = ThreadArg(first)
+		local target, options
+		if isThread then
+			target, options = select(2, ...)
+		else
+			target, options = ...
+		end
+		local level = if type(target) == "number" or type(target) == "string" then tonumber(target) else nil
+		if level == nil or level < 0 or type(options) ~= "string" then
+			return hostInfo(...) -- functions, and the host's own argument errors
+		end
+		local seen = {}
+		for i = 1, #options do
+			local c = string.sub(options, i, i)
+			if not OPTIONS[c] or seen[c] then
+				return hostInfo(...) -- invalid or duplicate option
+			end
+			seen[c] = true
+		end
+		level = math.floor(level)
+		if level == 0 and not isThread then
+			return hostInfo(0, options) -- level 0 is debug.info itself
+		end
+		local frames = Frames(thread, if thread then 0 else 1)
+		local frame = frames[if thread then level + 1 else level]
+		if frame == nil then
+			return
+		end
+		local site = frame.Site
+		local results = {}
+		for i = 1, #options do
+			local c = string.sub(options, i, i)
+			if c == "s" then
+				table.insert(results, if site then site.Name or "?" else frame.Source)
+			elseif c == "l" then
+				table.insert(results, if site then Env.LineOf(site, frame.Pc :: number) else frame.Line)
+			elseif c == "n" then
+				table.insert(results, if site then site.Proto.Name or "" else frame.Name)
+			elseif c == "f" then
+				table.insert(results, frame.Fn)
+			else
+				table.insert(results, if site then site.Proto.Params else frame.Params)
+				table.insert(results, if site then site.Proto.IsVararg else frame.Vararg)
+			end
+		end
+		return table.unpack(results, 1, #results)
+	end
+
+	-- error() at level 2 and above: the position of that guest-visible level, as luaL_where gives it.
+	-- @param level number – error level, 2 or more
+	function Builtins.LevelWhere(level: number): string
+		local frame = Frames(nil, 1)[math.floor(level)]
+		return if frame then Where(frame) else ""
+	end
+
+	-- Host value -> guest replacement
+	Builtins.Swaps = {
+		[pcall] = Pcall,
+		[xpcall] = Xpcall,
+		[hostCreate] = Create,
+		[hostWrap] = Wrap,
+		[hostInfo] = Info,
+		[hostTraceback] = Traceback,
+	} :: { [any]: any }
+
+	if type(hostTask) == "table" then
+		Builtins.Swaps[hostTask.spawn] = Spawn
+		Builtins.Swaps[hostTask.defer] = Defer
+		Builtins.Swaps[hostTask.delay] = Delay
+	end
+
+	-- Library tables guest code reads fields from at run time get copies holding the replacements.
+	for _, lib in { hostDebug, hostCoroutine, hostTask } do
+		if type(lib) == "table" then
+			local copy = table.clone(lib)
+			for key, value in copy do
+				local swap = Builtins.Swaps[value]
+				if swap then
+					copy[key] = swap
+				end
+			end
+			Builtins.Swaps[lib] = table.freeze(copy)
+		end
+	end
+
+	-- The subset Debug mode uses: there every guest function already positions the errors leaving it, so protected
+	-- calls and coroutine bodies need no handler of their own.
+	Builtins.DebugSwaps = { [hostInfo] = Info, [hostTraceback] = Traceback } :: { [any]: any }
+	if type(hostDebug) == "table" then
+		Builtins.DebugSwaps[hostDebug] = Builtins.Swaps[hostDebug]
+	end
+
+	-- Global names whose reads may need a swap
+	Builtins.Names = { pcall = true, xpcall = true, debug = true, coroutine = true, task = true } :: { [string]: boolean }
+
+	-- Wraps a chunk's main function so errors escaping to the host carry guest positions.
+	Builtins.Main = Guarded
+
+	Env.MarkInternal(Pcall)
+
+	return Builtins
+end)()
+
 -- Classes.luau
 local Module_Classes = (function()
 	-- Luau classes (bytecode versions 10 and 100): class objects, instances and the `class` library, after VM/src/lclass.cpp.
@@ -1992,195 +2610,6 @@ local Module_Classes = (function()
 	} :: { [any]: any }
 
 	return Classes
-end)()
-
--- Env.luau
-local Module_Env = (function()
-	-- Dynamic environments: getfenv/setfenv with the host's semantics, enabled by the DynamicEnv load option.
-	-- Why: by default globals bind to one environment at load time, which is fastest; code that swaps environments
-	-- needs every closure to carry its own environment and imports to re-resolve once an environment is exposed.
-	--
-	-- Each VM closure's upvalue table holds its environment under ENV and the closure itself under FN. Numeric levels
-	-- walk the host call stack: VM closures are real host functions there, interpreter internals are skipped, and
-	-- other functions (pcall, host callbacks) count as levels, as they do on the host.
-
-
-	local hostGetfenv = getfenv
-	local hostSetfenv = setfenv
-	local info = debug.info
-
-	-- Upvalue-table keys of a closure's environment and of the closure itself
-	local ENV, FN = "\0env", "\0fn"
-
-	-- Sources of interpreter modules; their frames are invisible to guest levels
-	local internal: { [string]: boolean } = {}
-	-- Interpreter functions run through a host pcall; that pcall's frame is invisible too
-	local guarded: { [any]: boolean } = {}
-
-	local Env = {}
-
-	Env.ENV = ENV
-	Env.FN = FN
-	Env.HostGetfenv = hostGetfenv
-	Env.HostSetfenv = hostSetfenv
-
-	-- Marks the module defining a function as interpreter-internal.
-	-- @param fn function – any function defined in that module
-	function Env.MarkInternal(fn: (...any) -> ...any)
-		internal[info(fn, "s")] = true
-	end
-
-	-- Marks an interpreter function the interpreter itself calls through pcall (Debug mode).
-	-- @param fn function – function passed to pcall
-	function Env.MarkGuarded(fn: (...any) -> ...any)
-		guarded[fn] = true
-	end
-
-	-- Replaces the position an interpreter module put on an error message with the guest's.
-	-- Why: Debug mode reports host-raised errors (calling nil, arithmetic on nil) at the guest line, as the host VM does.
-	-- @param message any – caught error value; non-strings and guest-positioned messages pass through
-	-- @param where string – guest "chunk:line: " prefix, or "" to drop the internal one
-	function Env.Reposition(message: any, where: string): any
-		if type(message) ~= "string" then
-			return message
-		end
-		local src, rest = string.match(message, "^(.-):%d+: (.*)$")
-		if src and internal[src] then
-			return where .. rest
-		end
-		return message
-	end
-
-	-- Function at a guest-visible stack level (1 = the function calling getfenv/setfenv); nil past the stack.
-	-- @param owners { [any]: any } – VM closures (defined in an internal module, yet guest-visible)
-	local function AtLevel(owners: { [any]: any }, level: number): any
-		local seen = 0
-		local i = 2 -- 1 is AtLevel's caller in this module
-		local skip = false
-		while true do
-			local fn = info(i, "f")
-			if fn == nil then
-				return nil
-			end
-			if skip then
-				skip = false
-			elseif guarded[fn] then
-				skip = true
-			elseif owners[fn] ~= nil or not internal[info(i, "s")] then
-				seen += 1
-				if seen == level then
-					return fn
-				end
-			end
-			i += 1
-		end
-	end
-
-	-- Creates a dynamic environment state. Level 0 is the running thread's globals, as on the host.
-	function Env.New(): EnvState
-		local state: EnvState
-		state = {
-			Unsafe = setmetatable({}, { __mode = "k" }) :: any,
-			Owners = setmetatable({}, { __mode = "k" }) :: any,
-			getfenv = nil :: any,
-			setfenv = nil :: any,
-		}
-
-		-- Environment of a function: its upvalue table's for VM closures; the thread's globals for C functions (the
-		-- VM-aware getfenv/setfenv stand in for C functions); the host's otherwise.
-		local function EnvOf(fn: any): any
-			local U = state.Owners[fn]
-			if U then
-				return U[ENV]
-			end
-			local src = info(fn, "s")
-			if src == "[C]" or internal[src] then
-				return hostGetfenv(0)
-			end
-			return hostGetfenv(fn)
-		end
-
-		-- Function at a level argument, with the host's argument errors (raised without a position, as by C).
-		-- @param name string – "getfenv" or "setfenv", for messages
-		-- @param target any – level argument
-		local function Resolve(name: string, target: any): (number, any)
-			local level = tonumber(target)
-			if level == nil then
-				error(`invalid argument #1 to '{name}' (number expected, got {typeof(target)})`, 0)
-			end
-			level = if level >= 0 then math.floor(level) else math.ceil(level)
-			if level < 0 then
-				error(`invalid argument #1 to '{name}' (level must be non-negative)`, 0)
-			elseif level == 0 then
-				return 0, nil
-			end
-			local fn = AtLevel(state.Owners, level)
-			if fn == nil then
-				error(`invalid argument #1 to '{name}' (invalid level)`, 0)
-			end
-			return level, fn
-		end
-
-		-- getfenv for guest code.
-		-- @param target any – level (default 1) or function
-		state.getfenv = function(target: any?): any
-			local env
-			if type(target) == "function" then
-				env = EnvOf(target)
-			else
-				local level, fn = Resolve("getfenv", if target == nil then 1 else target)
-				env = if level == 0 then hostGetfenv(0) else EnvOf(fn)
-			end
-			if type(env) == "table" then
-				state.Unsafe[env] = true
-			end
-			return env
-		end
-
-		-- setfenv for guest code; returns the function whose environment changed, as the host does.
-		state.setfenv = function(target: any, env: any): any
-			if type(env) ~= "table" then
-				error(`invalid argument #2 to 'setfenv' (table expected, got {typeof(env)})`, 0)
-			end
-			local fn = target
-			if type(target) ~= "function" then
-				local level
-				level, fn = Resolve("setfenv", target)
-				if level == 0 then
-					state.Unsafe[env] = true
-					hostSetfenv(0, env)
-					return nil
-				end
-			end
-			state.Unsafe[env] = true
-			local U = state.Owners[fn]
-			if U then
-				U[ENV] = env
-				return fn
-			end
-			local src = info(fn, "s")
-			if src == "[C]" or internal[src] then
-				error("'setfenv' cannot change environment of given object", 0)
-			end
-			return hostSetfenv(fn, env)
-		end
-
-		return state
-	end
-
-	-- Swaps the host getfenv/setfenv for the state's versions when guest code reads them.
-	function Env.Swap(state: EnvState, value: any): any
-		if rawequal(value, hostGetfenv) then
-			return state.getfenv
-		elseif rawequal(value, hostSetfenv) then
-			return state.setfenv
-		end
-		return value
-	end
-
-	Env.MarkInternal(Env.Swap)
-
-	return Env
 end)()
 
 -- Ops/Arith.luau
@@ -6429,6 +6858,7 @@ local Module_Compiler = (function()
 	local Fused = Module_Fused
 	local Objects = Module_Objects
 	local Classes = Module_Classes
+	local Builtins = Module_Builtins
 
 
 	local band = bit32.band
@@ -6500,14 +6930,18 @@ local Module_Compiler = (function()
 		return cells
 	end
 
-	-- Wraps error() so a message raised at level 1 carries the guest call site, not the handler's.
-	-- Higher levels name host frames the guest cannot see, so those messages stay bare.
+	-- Wraps error() so a message carries the guest position of its level: the call site for level 1, and the
+	-- guest-visible stack level (found by walking the host stack) for higher levels.
 	-- @param where string – "chunk:line: " prefix of the call site
 	local function GuestError(where: string): (...any) -> ()
 		return function(message: any, level: any)
 			local kind = type(message)
-			if (kind == "string" or kind == "number") and (level == nil or level == 1) then
-				error(where .. message, 0)
+			if kind == "string" or kind == "number" then
+				if level == nil or level == 1 then
+					error(where .. message, 0)
+				elseif type(level) == "number" and level >= 2 then
+					error(Builtins.LevelWhere(level) .. message, 0)
+				end
 			end
 			error(message, 0)
 		end
@@ -6582,22 +7016,30 @@ local Module_Compiler = (function()
 		local dyn = ctx.Dyn
 		local safe = ctx.SafeEnv and dyn == nil
 
-		-- class chunks: `class` is the interpreter's library, and type/typeof/getmetatable resolve to class-aware versions
+		-- Replacement of a host value guest code reads: stack-aware builtins, and class-aware ones in class chunks.
+		local function Swapped(value: any): any
+			if value == nil then
+				return nil
+			elseif ctx.Classes and Classes.Swaps[value] ~= nil then
+				return Classes.Swaps[value]
+			end
+			local swap = (if ctx.Debug then Builtins.DebugSwaps else Builtins.Swaps)[value]
+			return if swap ~= nil then swap else value
+		end
+
+		-- Imports resolved at load. In class chunks `class` is the interpreter's library, whatever SafeEnv says.
 		local ClassRoot = { class = Classes.Library }
-		local function ResolveClassImport(path: { any }): any
-			if path[1] == "class" then
+		local function ResolveImportSwapped(path: { any }): any
+			if ctx.Classes and path[1] == "class" then
 				return Analysis.ResolveImport(ClassRoot, path)
 			elseif not safe then
 				return nil
 			end
-			local value = Analysis.ResolveImport(env, path)
-			if value ~= nil and Classes.Swaps[value] ~= nil then
-				value = Classes.Swaps[value]
-			end
-			return value
+			return Swapped(Analysis.ResolveImport(env, path))
 		end
 
-		local prog = Analysis.Analyze(proto, cells, env, safe, ctx.Debug, if ctx.Classes then ResolveClassImport else nil)
+		local prog = Analysis.Analyze(proto, cells, env, safe, ctx.Debug, ResolveImportSwapped)
+		local site: Site = { Name = ctx.ChunkName, Proto = proto }
 
 		local OpOf, OA, OB, OC, OD, Aux, Len = prog.Op, prog.A, prog.B, prog.C, prog.D, prog.Aux, prog.Len
 		local base = prog.Base
@@ -6618,11 +7060,19 @@ local Module_Compiler = (function()
 			return ""
 		end
 
-		-- Values swapped when guest code reads them: VM-aware getfenv/setfenv, positioned error/assert wrappers.
-		local function Swaps(pc: number): { [any]: any }?
+		-- Values swapped when guest code reads them: VM-aware getfenv/setfenv, positioned error/assert wrappers, and
+		-- stack-aware builtins when the global's name is one of theirs.
+		-- @param name string? – global name (or import root) read at pc
+		local function Swaps(pc: number, name: string?): { [any]: any }?
 			local swaps: { [any]: any }? = nil
 			if dyn then
 				swaps = { [Env.HostGetfenv] = dyn.getfenv, [Env.HostSetfenv] = dyn.setfenv }
+			end
+			if name and Builtins.Names[name] then
+				swaps = swaps or {}
+				for host, replacement in if ctx.Debug then Builtins.DebugSwaps else Builtins.Swaps do
+					(swaps :: any)[host] = replacement
+				end
 			end
 			if ctx.Classes then
 				swaps = swaps or {}
@@ -6927,10 +7377,10 @@ local Module_Compiler = (function()
 			elseif op == Op.GETGLOBAL and ctx.Classes and K[Aux[pc] + 1] == "class" then
 				return Values.LoadK(A, Classes.Library, nextH, chain)
 			elseif op == Op.GETGLOBAL and dyn then
-				return Values.GetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], Swaps(pc), nextH, chain)
+				return Values.GetGlobalDyn(A, Env.ENV, K[Aux[pc] + 1], Swaps(pc, K[Aux[pc] + 1]), nextH, chain)
 			elseif op == Op.GETGLOBAL then
 				-- the global may be replaced at any time, so swaps (positioned error/assert, class builtins) happen per read
-				local swaps = Swaps(pc)
+				local swaps = Swaps(pc, K[Aux[pc] + 1])
 				if swaps then
 					return Values.GetGlobalSwapped(A, env, K[Aux[pc] + 1], swaps, nextH, chain)
 				end
@@ -6950,20 +7400,17 @@ local Module_Compiler = (function()
 			elseif op == Op.CLOSEUPVALS then
 				return Values.CloseUpvals(A, nextH, chain)
 			elseif op == Op.GETIMPORT and ctx.Classes and Analysis.ImportPath(K, Aux[pc])[1] == "class" then
-				return Values.LoadK(A, ResolveClassImport(Analysis.ImportPath(K, Aux[pc])), nextH, chain)
+				return Values.LoadK(A, ResolveImportSwapped(Analysis.ImportPath(K, Aux[pc])), nextH, chain)
 			elseif op == Op.GETIMPORT and dyn then
 				local path = Analysis.ImportPath(K, Aux[pc])
 				local resolved = if ctx.SafeEnv and not dyn.Unsafe[env] then Analysis.ResolveImport(env, path) else nil
-				return Values.GetImportDyn(A, Env.ENV, path, resolved, env, dyn.Unsafe, Swaps(pc), nextH, chain)
+				return Values.GetImportDyn(A, Env.ENV, path, Swapped(resolved), env, dyn.Unsafe, Swaps(pc, path[1]), nextH, chain)
 			elseif op == Op.GETIMPORT then
 				local path = Analysis.ImportPath(K, Aux[pc])
 				if ctx.SafeEnv then
 					local value = prog.Imports[pc]
 					if value == nil then
-						value = Analysis.ResolveImport(env, path)
-					end
-					if ctx.Classes and value ~= nil and Classes.Swaps[value] ~= nil then
-						value = Classes.Swaps[value]
+						value = Swapped(Analysis.ResolveImport(env, path))
 					end
 					local site = prog.Positioned[pc]
 					local where = if site then Where(site) else ""
@@ -6974,7 +7421,7 @@ local Module_Compiler = (function()
 						return Values.LoadK(A, value, nextH, chain)
 					end
 				end
-				local swaps = Swaps(pc)
+				local swaps = Swaps(pc, path[1])
 				if swaps then
 					return Values.GetImportSwapped(A, env, path, swaps, nextH, chain)
 				end
@@ -7109,6 +7556,7 @@ local Module_Compiler = (function()
 		for i = #live, 1, -1 do
 			local pc = live[i]
 			local h = Build(pc)
+			Env.Register(h, site, pc)
 			local list = prog.Wrappers[pc]
 			if list then
 				for _, loop in list do
@@ -7118,6 +7566,7 @@ local Module_Compiler = (function()
 			if ctx.Debug then
 				h = Track(h, pc)
 			end
+			Env.Register(h, site, pc)
 			Top[pc] = h
 		end
 
@@ -7180,13 +7629,14 @@ local Module_Compiler = (function()
 			local main = ctx.Factories[chunk.Main](U)
 			U[Env.FN] = main
 			dyn.Owners[main] = U
-			return main
+			return if ctx.Debug then main else Builtins.Main(main)
 		end
-		return ctx.Factories[chunk.Main]({})
+		local main = ctx.Factories[chunk.Main]({})
+		return if ctx.Debug then main else Builtins.Main(main)
 	end
 
 	-- interpreter frames are invisible to guest stack levels (getfenv/setfenv under DynamicEnv)
-	for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler, Objects, Classes } do
+	for _, module in { Values, Arith, Tables, Calls, Branches, Loops, Closures, Fused, Runtime, Analysis, Compiler, Objects, Classes, Builtins } do
 		for _, member in module :: any do
 			if type(member) == "function" then
 				Env.MarkInternal(member)
@@ -7197,6 +7647,13 @@ local Module_Compiler = (function()
 	Env.MarkInternal(ResolveCells)
 	Env.MarkInternal(Env.Reposition)
 	Env.MarkGuarded(Run)
+
+	-- guest functions are the closures factories make; each variant has its own definition site
+	local function Probe(_S: Frame): any
+		return nil
+	end
+	Env.MarkEntry(Runtime.Factory(Probe, 0, 0, false, {}, 0)({}))
+	Env.MarkEntry(Runtime.Factory(Probe, 0, 0, true, {}, 0)({}))
 
 	return Compiler
 end)()
@@ -7529,6 +7986,19 @@ local Module_init = (function()
 		error("vector constants need the vector library or Vector3", 0)
 	end
 
+	-- Whether any function of a chunk names getfenv or setfenv (as a global, an import or a field).
+	-- Why: DynamicEnv turns itself on for such chunks, as the host deoptimizes environments for them.
+	local function UsesFenv(chunk: Chunk): boolean
+		for _, proto in chunk.Protos do
+			for _, k in proto.Constants do
+				if k == "getfenv" or k == "setfenv" then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	-- Loads bytecode and returns its main function.
 	-- @param bytecode string | buffer – serialized Luau bytecode (luau-compile --binary / luau_compile)
 	-- @param env table? – globals for the chunk; defaults to the caller-independent shared _G
@@ -7538,7 +8008,7 @@ local Module_init = (function()
 		local chunk = Deserialize(bytecode, opts.Vector or DefaultVector)
 		local globals = env or _G
 		local dyn: EnvState? = nil
-		if opts.DynamicEnv == true then
+		if opts.DynamicEnv == true or (opts.DynamicEnv == nil and UsesFenv(chunk)) then
 			dyn = Env.New()
 		elseif opts.DynamicEnv then
 			dyn = opts.DynamicEnv :: any
