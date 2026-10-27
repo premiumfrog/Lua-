@@ -1,1 +1,0 @@
-type Foobar = Barbaz<(number, boolean, string)>

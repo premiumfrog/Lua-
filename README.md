@@ -1,84 +1,164 @@
-Luau ![CI](https://github.com/luau-lang/luau/actions/workflows/build.yml/badge.svg) [![codecov](https://codecov.io/gh/luau-lang/luau/branch/master/graph/badge.svg)](https://codecov.io/gh/luau-lang/luau)
-====
+# Luau bytecode interpreter in Luau
 
-Luau (lowercase u, /ˈlu.aʊ/) is a fast, small, safe, gradually typed embeddable scripting language derived from [Lua](https://lua.org).
+This interpreter runs Luau bytecode (versions 3 to 14 and the experimental class version 100, type version 3) on any Luau host, including Roblox. It loads the
+bytecode once and turns it into graphs of host closures, so running it involves no opcode dispatch. It is a rework of the
+handler-closure design used by [vantoanvh/LuauVM](https://github.com/vantoanvh/LuauVM), and it is faster on all
+17 workloads in the benchmark suite (1.38x geometric mean).
 
-It is designed to be backwards compatible with Lua 5.1, as well as incorporating [some features](https://luau.org/compatibility) from future Lua releases, but also expands the feature set (most notably with type annotations and a state-of-the-art type inference system). Luau is largely implemented from scratch, with the language runtime being a very heavily modified version of Lua 5.1 runtime, with completely rewritten interpreter and other [performance innovations](https://luau.org/performance). The runtime mostly preserves Lua 5.1 API, so existing bindings should be more or less compatible with a few caveats.
+```luau
+local Interpreter = require(path.to.Interpreter) -- src/ as a folder of modules, or bundled/Interpreter.luau
 
-Luau is used by Roblox game developers to write game code, and by Roblox engineers to implement large parts of the user-facing application code as well as portions of the editor (Roblox Studio) as plugins. Roblox chose to open-source Luau to foster collaboration within the Roblox community as well as to allow other companies and communities to benefit from the ongoing language and runtime innovation. More recently, Luau has seen adoption in games like Alan Wake 2, Farming Simulator 2025, Second Life, and Warframe.
+local main = Interpreter.Load(bytecode, getfenv(), {
+	SafeEnv = true, -- resolve imports such as math.floor once, at load time (default)
+	ChunkName = "[string \"MyChunk\"]", -- error()/assert() and method-call errors get "MyChunk:line:" positions
+	DynamicEnv = false, -- per-closure environments with getfenv/setfenv (default off)
+	Debug = false, -- host-exact error positions and garbage collection timing (default off)
+})
+print(main(...))
+```
 
-This repository hosts source code for the language implementation and associated tooling. Documentation for the language is available at https://luau.org/ and accepts contributions via [site repository](https://github.com/luau-lang/site); the language is evolved through RFCs that are located in [rfcs repository](https://github.com/luau-lang/rfcs).
+### Options
 
-# Usage
+| Option | Default | Effect |
+| --- | --- | --- |
+| `SafeEnv` | `true` | Imports such as `math.floor` resolve once at load. Turn it off when globals are replaced after loading. |
+| `ChunkName` | none | Prefix for guest error positions (`name:line:`). |
+| `DynamicEnv` | `false` | Every closure carries its own environment. Guest code gets `getfenv`/`setfenv` with the host's semantics: numeric levels, function targets, level 0 as the thread's globals, the host's error messages, and imports re-resolving once an environment has been exposed. Pass `true`, or a state from `Interpreter.NewEnvState()` to share one between chunks. |
+| `Debug` | `false` | Errors the host raises inside handlers ("attempt to call a nil value", arithmetic on nil) get the guest position, and no handler keeps a value alive after the guest stops referencing it, so weak tables clear exactly as they do natively. It returns to a trampoline after every instruction and tracks the current instruction, which makes the benchmark workloads 1.6 to 1.9 times slower. |
 
-Luau is an embeddable programming language, but it also comes with two command-line tools by default, `luau` and `luau-analyze`.
+`bytecode` is the output of `luau-compile --binary` or `luau_compile`, as a string or a buffer. Line positions need
+line info, so compile with `-g1`. `Interpreter.Deserialize` exposes the parser for tooling.
 
-`luau` is a command-line REPL and can also run input files. Note that REPL runs in a sandboxed environment and as such doesn't have access to the underlying file system except for ability to `require` modules.
+## Layout
 
-`luau-analyze` is a command-line type checker and linter; given a set of input files, it produces errors/warnings according to the file configuration, which can be customized by using `--!` comments in the files or [`.luaurc`](https://rfcs.luau.org/config-luaurc) files. For details, please refer to our [type checking](https://luau.org/typecheck) and [linting](https://luau.org/lint) documentation. Our community maintains a language server frontend for `luau-analyze` called [luau-lsp](https://github.com/JohnnyMorganz/luau-lsp) for use with text editors.
+The interpreter ships in two equivalent forms:
 
-# Installation
+* `src/` is the source: one module per responsibility (table below). Use it as a ModuleScript tree, with `init` as
+  the parent.
+* `bundled/Interpreter.luau` is the entire interpreter in one dependency-free file, generated from `src/` by
+  `python3 tools/bundle.py`. Drop it into a single ModuleScript. Edit `src/` and regenerate; CI fails when the bundle
+  is out of date, and the test matrix runs against both forms.
 
-You can install and run Luau by downloading the compiled binaries from [a recent release](https://github.com/luau-lang/luau/releases); note that `luau` and `luau-analyze` binaries from the archives will need to be added to PATH or copied to a directory like `/usr/local/bin` on Linux/macOS.
+| Module | Responsibility |
+| --- | --- |
+| `init` | Public API: `Load`, `NewEnvState` and `Deserialize` |
+| `Deserializer` | Bytecode parsing into protos (constants, imports, children, line info) |
+| `Analysis` | Per-proto control flow and dataflow analysis, producing the plan the compiler builds from |
+| `Compiler` | Maps every planned instruction to its handler maker, back to front |
+| `Runtime` | Frame pools, the function trampoline, the return protocol and upvalue cells |
+| `Classes` | Luau classes: class values, instances, inheritance, private members and the `class` library |
+| `Env` | `DynamicEnv` state: VM-aware `getfenv`/`setfenv`, stack levels, `Debug` error repositioning |
+| `Ops/*` | Handler makers grouped by kind: values, arithmetic, tables, calls, branches, loops, closures |
+| `Ops/Fused` | Generated handlers for hot instruction pairs (`tools/gen_fused.py`) |
 
-Alternatively, you can use one of the packaged distributions (note that these are not maintained by Luau development team):
+## How it executes
 
-- macOS: [Install Homebrew](https://docs.brew.sh/Installation) and run `brew install luau`
-- Arch Linux: Luau has been added to the official Arch Linux packages repository under the extras repository (see [``luau``](https://archlinux.org/packages/extra/x86_64/luau/)), simply install using ``pacman``: ``pacman -Syu luau``
-- Alpine Linux: [Enable community repositories](https://wiki.alpinelinux.org/w/index.php?title=Enable_Community_Repository) and run `apk add luau`
-- Gentoo Linux: Luau is [officially packaged by Gentoo](https://packages.gentoo.org/packages/dev-lang/luau) and can be installed using `emerge dev-lang/luau`. You may have to unmask the package first before installing it (which can be done by including the `--autounmask=y` option in the `emerge` command).
+Each live instruction becomes one closure with its operands captured as upvalues. A handler either calls its successor
+directly (chaining) or returns it to the nearest trampoline. Loops run as real host loops:
 
-After installing, you will want to validate the installation was successful by running the test case [here](https://luau.org/getting-started).
+* `FORNPREP`/`FORNLOOP` and `FORGPREP*`/`FORGLOOP` become host `for` statements. Generic loops keep the host's `next`,
+  `ipairs` and `__iter` fast paths.
+* Every other backward jump closes a "back loop" whose header restarts the body when the body returns the loop's token.
 
-## Building
+Analysis removes work before any handler exists:
 
-On all platforms, you can use CMake to run the following commands to build Luau binaries from source:
+* **Folding.** Loads that only feed a call, such as constants, resolved imports, register copies and the callee
+  upvalue, are folded into the call, so `math.floor(x)` runs as one handler. Constants live in slots in front of the
+  registers, so a folded constant is read like a register. The same applies to the setup operands of numeric loops and
+  to constant operands of compares (`n < 2`), where a bounded liveness check proves the temporary dead.
+* **Method calls.** `NAMECALL` is folded into its `CALL`, and `select(i, ...)` indexes the vararg table directly.
+* **Fusion.** `x = a < b` and `return a > b` become one handler that stores or returns the condition. Hot adjacent
+  pairs share one handler, such as field load into arithmetic, arithmetic into a field store, chained arithmetic,
+  upvalue indexing, and a value tested by the next branch (`if t.x then`, `if i % 3 == 0 then`).
+* **Calls.** A call is a plain host call to a host closure, so pcall, coroutines and host callbacks behave natively.
+  Each proto has a frame pool, the factory has fixed-arity and vararg entries, and tail calls run in the factory's
+  tail position, so deep tail recursion uses no extra host stack.
+
+## Benchmarks
+
+The table below compares times for O2 bytecode, best of 7 runs on the Luau CLI. "native" is the host running the same
+source. Speedup is against the reference VM.
+
+| Workload | native | this VM | reference | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| array | 19.5 ms | 142.9 ms | 243.2 ms | 1.70x |
+| binary_trees | 16.1 ms | 131.1 ms | 160.0 ms | 1.22x |
+| builtins | 18.9 ms | 245.1 ms | 328.2 ms | 1.34x |
+| closures | 13.9 ms | 141.2 ms | 157.5 ms | 1.12x |
+| coroutines | 10.7 ms | 27.4 ms | 50.4 ms | 1.84x |
+| fib | 5.0 ms | 56.6 ms | 68.2 ms | 1.20x |
+| fields | 27.7 ms | 261.1 ms | 345.1 ms | 1.32x |
+| iterate | 5.7 ms | 66.7 ms | 100.4 ms | 1.50x |
+| nbody | 74.3 ms | 925.0 ms | 1156.2 ms | 1.25x |
+| numeric_loop | 58.9 ms | 342.7 ms | 420.0 ms | 1.23x |
+| oop | 80.0 ms | 641.4 ms | 913.5 ms | 1.42x |
+| queens | 12.4 ms | 89.3 ms | 110.9 ms | 1.24x |
+| sieve | 22.8 ms | 142.8 ms | 234.7 ms | 1.64x |
+| sort | 50.0 ms | 193.8 ms | 238.9 ms | 1.23x |
+| strings | 27.8 ms | 76.4 ms | 101.0 ms | 1.32x |
+| varargs | 18.6 ms | 263.6 ms | 462.2 ms | 1.75x |
+| while_loop | 41.3 ms | 314.4 ms | 421.9 ms | 1.34x |
+
+To reproduce, run these from the repository root with a built Luau (see Tests). The `--ref` option takes any module exposing `Load(bytecode, env)`.
 
 ```sh
-mkdir cmake && cd cmake
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build . --target Luau.Repl.CLI --config RelWithDebInfo
-cmake --build . --target Luau.Analyze.CLI --config RelWithDebInfo
+python3 tools/embed.py luau-compile build/bench 2 bench/workloads/*.luau
+luau -O2 tools/bench.luau -a build/bench fib nbody sort --ref build/RefVM
 ```
 
-Alternatively, on Linux and macOS, you can also use `make`:
+## Tests
+
+The tests need the Luau CLI and compiler, plus a Luau source checkout for `tests/conformance`:
 
 ```sh
-make config=release luau luau-analyze
+git clone https://github.com/premiumfrog/Lua- --branch master luau
+make -C luau -j4 config=release luau luau-compile
+python3 tests/run.py luau/luau luau/luau-compile --luau-source luau
 ```
 
-To integrate Luau into your CMake application projects as a library, at the minimum, you'll need to depend on `Luau.Compiler` and `Luau.VM` projects. From there you need to create a new Luau state (using Lua 5.x API such as `lua_newstate`), compile source to bytecode and load it into the VM like this:
+`tests/run.py` runs everything at O0, O1 and O2, in the default (fast) configuration and with `Debug`, against both
+`src/` and the bundle (`--builds src,bundled`). CI runs it on every change (`.github/workflows/interpreter.yml`).
 
-```cpp
-// needs lua.h and luacode.h
-size_t bytecodeSize = 0;
-char* bytecode = luau_compile(source, strlen(source), NULL, &bytecodeSize);
-int result = luau_load(L, chunkname, bytecode, bytecodeSize, 0);
-free(bytecode);
+* **Conformance.** Luau's own `tests/conformance` suite (from `--luau-source`, or `$LUAU_SOURCE`), run natively and through the interpreter in the
+  environment `tests/Conformance.test.cpp` gives each test: its own thread with fresh writable globals, `loadstring`
+  bound to the thread's globals, and `limitedstack` set (interpreted calls keep their frames on the heap, so deep
+  recursion stress runs out of memory rather than stack, like the ASAN and debug builds the flag exists for). Tests
+  using `getfenv`/`setfenv` load with `DynamicEnv`, and `classes` is compiled and run with the class fast flags
+  `Conformance.test.cpp` sets. All 38 tests that run natively under the CLI pass at every level with `Debug`. In the
+  fast configuration, `tmerror` (positions on host-raised errors) and `closure` (weak-table collection timing) are
+  not run, and the other 36 pass.
+* **Skipped conformance tests.** 18 tests fail natively under the CLI because they need the C++ test host: native
+  code generation, userdata and light userdata constructors, coverage and debugger hooks, `collectgarbage` options,
+  or running on the main thread. `jit_inliner` needs a compiler flag for the native inliner.
+* **Interpreter tests.** `tests/unit` covers what the interpreter rewrites: environments, error positions, collection
+  timing, coroutines, metamethods and host callbacks, control flow, calls and varargs, globals and values. Each test
+  must pass natively too, so it only checks real Luau behavior. A `-- interpreter: debug-only` line limits a test to
+  `Debug`, and `-- interpreter: unsafe-env` loads it with `SafeEnv` off.
 
-if (result == 0)
-    return 1; /* return chunk main function */
-```
+`tools/conformance.py` runs one suite at one level (`--mode fast|debug`, `--build src|bundled`, `--dir`, `--strict`,
+test names).
 
-For more details about the use of the host API, see the [C API documentation](https://luau.org/api).
-Much of it is similar to the [Lua 5.x API](https://www.lua.org/manual/5.1/manual.html#3), but Luau has a few deviations, such as the need to compile source separately (which is important to be able to deploy VM without a compiler), and the lack of `__gc` support (use `lua_newuserdatadtor` instead).
+## Limitations
 
-To gain advantage of many performance improvements, it's highly recommended to use the `safeenv` feature, which sandboxes individual scripts' global tables from each other, and protects builtin libraries from monkey-patching. For this to work, you must call `luaL_sandbox` on the global state and `luaL_sandboxthread` for each new script's execution thread.
+* Without `DynamicEnv`, `getfenv`/`setfenv` on interpreted functions do not affect the environment they captured at
+  load.
+* Without `Debug`, errors raised by the host inside handlers, such as arithmetic on nil or calling a nil value, carry
+  the handler's position rather than the guest line. Guest `error()` (level 1), `assert()` and missing methods are
+  positioned in both modes when a `ChunkName` is given.
+* `error(message, 2)` and higher levels raise the message without a position.
+* Class values and instances are tables behind protected metatables, because Luau code cannot create new value
+  types. In class chunks, `type`, `typeof` and `getmetatable` are swapped for class-aware versions and `class` is
+  the interpreter's own library, so guest code sees `"class"`/`"object"` and the host's error messages. Raw access
+  (`rawget`, `next`) and the default `tostring` address differ from the host's.
+* With `SafeEnv` (the default), imports that resolve at load time are fixed. Turn `SafeEnv` off when globals are
+  replaced after loading.
+* `debug.info` and `debug.traceback` describe the interpreter's frames, not the guest's.
+* Each proto keeps up to 17 frames for reuse, which can hold stale register values until they are reused.
 
-# Testing
+## Tools
 
-Luau has an internal test suite; in CMake builds, it is split into two targets, `Luau.UnitTest` (for the bytecode compiler and type checker/linter tests) and `Luau.Conformance` (for the VM tests). The unit tests are written in C++, whereas the conformance tests are largely written in Luau (see `tests/conformance`).
-
-Makefile builds combine both into a single target that can be run via `make test`.
-
-# Dependencies
-
-Luau uses C++ as its implementation language. The runtime requires C++11, while the compiler and analysis components require C++17. It should build without issues using Microsoft Visual Studio 2017 or later, or gcc-7 or clang-7 or later.
-
-Other than the STL/CRT, Luau library components don't have external dependencies. The test suite depends on the [doctest](https://github.com/onqtam/doctest) testing framework, and the REPL command-line depends on [isocline](https://github.com/daanx/isocline).
-
-# License
-
-Luau implementation is distributed under the terms of [MIT License](https://github.com/luau-lang/luau/blob/master/LICENSE.txt). It is based on the Lua 5.x implementation, also under the MIT License.
-
-When Luau is integrated into external projects, we ask that you honor the license agreement and include Luau attribution into the user-facing product documentation. Attribution making use of the [Luau logo](https://github.com/luau-lang/site/blob/master/logo.svg) is also encouraged when reasonable.
+* `tools/embed.py` compiles sources and embeds them as Luau modules for the drivers.
+* `tools/gen_fused.py` regenerates `src/Ops/Fused.luau`.
+* `tools/bundle.py` regenerates `bundled/Interpreter.luau` (`--check` verifies it is current).
+* `tools/bench.luau` is the benchmark driver.
+* `tools/conformance.py` and `tools/conformance.luau` run one test suite; `tests/run.py` runs all of them.

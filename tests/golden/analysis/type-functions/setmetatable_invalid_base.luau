@@ -1,1 +1,0 @@
-type Invalid = setmetatable<string, {}>

@@ -2,21 +2,7 @@ name: interpreter
 
 on:
   push:
-    branches:
-      - 'master'
-    paths:
-      - 'Interpreter/**'
-      - 'tests/conformance/**'
-      - 'Compiler/**'
-      - 'VM/**'
-      - '.github/workflows/interpreter.yml'
   pull_request:
-    paths:
-      - 'Interpreter/**'
-      - 'tests/conformance/**'
-      - 'Compiler/**'
-      - 'VM/**'
-      - '.github/workflows/interpreter.yml'
 
 jobs:
   test:
@@ -24,8 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: check the bundle matches src
+      run: python3 tools/bundle.py --check
+    - name: check out Luau (CLI, compiler and conformance tests)
+      uses: actions/checkout@v4
+      with:
+        repository: premiumfrog/Lua-
+        ref: master
+        path: luau
     - name: build luau and luau-compile
-      run: make -j4 config=release luau luau-compile
-    - name: run interpreter tests (conformance + tests/unit, O0-O2, fast and debug)
-      working-directory: Interpreter
-      run: python3 tests/run.py ../luau ../luau-compile
+      run: make -C luau -j4 config=release luau luau-compile
+    - name: run interpreter tests (conformance + tests/unit, O0-O2, fast and debug, src and bundled)
+      run: python3 tests/run.py luau/luau luau/luau-compile --luau-source luau
